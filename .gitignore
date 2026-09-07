@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+#  Secrets — never commit a real config or env file
+# ---------------------------------------------------------------------------
+# Live configs: everything except the *.example.* templates is site-specific.
+dbtool.yml
+dbtool.yaml
+dbtool.json
+dbtool.*.yml
+dbtool.*.yaml
+dbtool.*.json
+!dbtool.example.yml
+!dbtool.example.yaml
+!dbtool.example.json
+
+# Env / dotenv files
+.env
+.env.*
+*.env
+!*.env.example
+
+# Password and key material
+*.pass
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.jks
+.pgpass
+.my.cnf
+*secrets*.env
+
+# ---------------------------------------------------------------------------
+#  Backup artifacts — dumps contain production data
+# ---------------------------------------------------------------------------
+*.dump
+*.dump.*
+*.sql
+*.sql.gz
+*.sql.zst
+*.tar
+*.tar.gz
+*.tar.zst
+*.sha256
+*.meta.json
+*.part
+backup/
+backups/
+db-backups/
+
+# ---------------------------------------------------------------------------
+#  Logs / runtime
+# ---------------------------------------------------------------------------
+*.log
+*.pid
+tmp/
+.cache/
+
+# ---------------------------------------------------------------------------
+#  Editor / OS noise
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.direnv/

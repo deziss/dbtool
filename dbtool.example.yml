@@ -1,0 +1,116 @@
+# ==========================================================================
+#  dbtool.yml — configuration for dbtool.sh
+#  Anything of the form ${VAR} or ${VAR:-fallback} is expanded from the
+#  environment, after env_file below is loaded.
+# ==========================================================================
+
+# Optional: dotenv file(s) loaded before expansion. Existing env wins.
+env_file: /etc/dbtool/dbtool.env
+# env_file:
+#   - /etc/dbtool/dbtool.env
+#   - /etc/dbtool/secrets.env
+
+defaults:
+  backup_dir: /backup/db            # where dumps land
+  log_file: /var/log/dbtool.log
+  retention_days: 14                # local dumps older than this are pruned
+  retention_min_keep: 3             # ...but always keep at least N per database
+  compression: zstd                 # zstd | gzip | none  (plain/mysql dumps)
+  pg_compress_level: 6              # internal compression for pg custom format
+  format: custom                    # custom | plain | directory   (postgres)
+  jobs: 4                           # parallel workers for directory dumps
+  docker: auto                      # auto | always | never  -> version-matched client
+  docker_network: host
+  timeout: 7200                     # seconds, per dump/restore
+  timestamp_format: "%Y%m%d-%H%M%S"
+
+# Optional off-box copy via MinIO client (mc) or awscli
+s3:
+  enabled: false
+  provider: mc                      # mc | aws
+  alias: minio                       # `mc alias set minio https://s3.example.com ...`
+  bucket: db-backups
+  prefix: db01
+  # endpoint: https://s3.example.com  # aws provider only
+  # profile: default                # aws provider only
+  keep_remote: true                 # false = delete remote copies past retention too
+
+notify:
+  webhook: ""                       # POST a JSON summary here on failure (optional)
+
+# --------------------------------------------------------------------------
+#  Sources — what gets backed up
+# --------------------------------------------------------------------------
+databases:
+  # 1) Simplest form: reuse an existing SQLAlchemy/dotenv URL as-is.
+  - name: app_dev
+    url: "postgresql+asyncpg://app_user:${APP_PG_PASSWORD}@${DB_HOST}:5432/app_dev"
+
+  # 2) Explicit fields. Anything set here overrides the url.
+  - name: app_prod
+    engine: postgres                # postgres | mysql (mariadb counts as mysql)
+    host: db-primary.example.com
+    port: 5432
+    user: app_user
+    password_env: APP_PG_PASSWORD   # read from env instead of the file
+    database: app_prod
+    sslmode: prefer
+    format: custom
+    no_owner: true
+    exclude_tables:
+      - audit_log
+      - celery_taskmeta
+    dump_args: ["--no-privileges"]
+
+  - name: analytics_pg
+    engine: postgres
+    host: db-analytics.example.com
+    port: 5432
+    user: postgres
+    password_file: /etc/dbtool/analytics.pass
+    database: analytics
+    format: directory               # parallel dump, tarred afterwards
+    jobs: 6
+
+  - name: crm_mysql
+    engine: mysql
+    host: db-primary.example.com
+    port: 3306
+    user: crm_user
+    password: "${CRM_DB_PASSWORD}"
+    database: crm_mysql
+    dump_args: ["--single-transaction", "--routines", "--triggers", "--events"]
+
+  - name: legacy_mysql
+    engine: mysql
+    url: "mysql+pymysql://root:${LEGACY_MYSQL_PASSWORD}@db-legacy.example.com:3307/legacy_app"
+    enabled: false                  # skipped by `backup all`
+
+# --------------------------------------------------------------------------
+#  Targets — where `restore` / `migrate` can write
+# --------------------------------------------------------------------------
+targets:
+  staging_pg:
+    engine: postgres
+    host: db-analytics.example.com
+    port: 5432
+    user: postgres
+    password: "${STAGING_PG_PASSWORD}"
+    database: app_dev
+    create: true                    # CREATE DATABASE if missing
+    clean: false                    # pg_restore --clean --if-exists
+    restore_args: ["--no-owner", "--no-privileges"]
+
+  new_server_pg:
+    engine: postgres
+    url: "postgresql://postgres:${NEW_PG_PASSWORD}@db-new.example.com:5432/app_prod"
+    create: true
+
+  new_server_mysql:
+    engine: mysql
+    host: db-new.example.com
+    port: 3306
+    user: root
+    password: "${NEW_MYSQL_PASSWORD}"
+    database: crm_mysql
+    create: true

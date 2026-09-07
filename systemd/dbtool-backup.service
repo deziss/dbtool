@@ -1,0 +1,25 @@
+[Unit]
+Description=Database backup (dbtool)
+Documentation=file:/opt/dbtool/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# Keep credentials out of the unit: dbtool reads them from the config / env_file.
+Environment=DBTOOL_CONFIG=/etc/dbtool/dbtool.yml
+ExecStart=/opt/dbtool/dbtool.sh backup all --yes --quiet
+TimeoutStartSec=4h
+Nice=10
+IOSchedulingClass=idle
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Must match defaults.backup_dir in your config.
+ReadWritePaths=/backup/db /var/log
+
+[Install]
+WantedBy=multi-user.target

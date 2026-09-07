@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly database backup (dbtool)
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=dbtool-backup.service
+
+[Install]
+WantedBy=timers.target
