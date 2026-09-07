@@ -422,7 +422,16 @@ MY_CNF="$RUNDIR/my.cnf"
 declare -a DOCKER_EXTRA=()
 declare -a CLEAN_PATHS=()
 
-cleanup() { rm -rf "$RUNDIR" ${CLEAN_PATHS[@]+"${CLEAN_PATHS[@]}"} 2>/dev/null || true; }
+cleanup() {
+    rm -rf "$RUNDIR" 2>/dev/null || true
+    local p
+    for p in ${CLEAN_PATHS[@]+"${CLEAN_PATHS[@]}"}; do
+        # only ever remove our own in-progress artifacts, never a device or a root
+        case "$p" in
+            *.part|*.dir) rm -rf "$p" 2>/dev/null || true ;;
+        esac
+    done
+}
 trap cleanup EXIT
 trap 'err "aborted (signal)"; exit 130' INT TERM
 
@@ -790,6 +799,27 @@ build_my_dump_args() {  # populates DUMPARGS
 # also matches a longer sibling entry (app_db vs app_db_archive), which made
 # --latest restore the wrong database and let prune delete the only copy of one.
 # Anchor on the engine token that always follows the entry name.
+# Where a dump is written while it runs. A dry run writes nowhere: the caller's
+# redirection is set up by the shell before pg_run can decide to only print.
+dump_target() {  # dump_target <final-path>  -> path to redirect the dump into
+    if $DRY_RUN; then printf '/dev/null'; else printf '%s.part' "$1"; fi
+}
+
+# A .part can only survive a crash, a kill -9, or a dry run of an older build:
+# CLEAN_PATHS is appended to inside a subshell, and subshells do not run the
+# parent's EXIT trap. The lock guarantees nobody else is mid-dump right now, so
+# anything left here is orphaned.
+sweep_stale_parts() {
+    local -a stale=()
+    mapfile -t stale < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f -name '*.part' 2>/dev/null)
+    (( ${#stale[@]} )) || return 0
+    local f
+    for f in "${stale[@]}"; do
+        $DRY_RUN && { log "would remove orphaned $(basename "$f")"; continue; }
+        rm -f "$f" && warn "removed orphaned $(basename "$f") from an earlier interrupted run"
+    done
+}
+
 backups_for() {  # backups_for <entry-name>  -> newest first, one path per line
     find "$CFG_BACKUP_DIR" -maxdepth 1 -type f \
          \( -name "$1_postgres_*" -o -name "$1_mysql_*" \) \
@@ -866,23 +896,23 @@ backup_one() {
         build_pg_dump_args
         case "$CTX_FORMAT" in
             custom)
-                final="${base}.dump"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
+                final="${base}.dump"; tmp="$(dump_target "$final")"
                 log "dumping $name (pg custom, level $CFG_PG_COMPRESS_LEVEL) -> $(basename "$final")"
                 pg_run pg_dump "${DUMPARGS[@]}" -Fc -Z "$CFG_PG_COMPRESS_LEVEL" >"$tmp" \
                     || { rm -f "$tmp"; die "pg_dump failed for $name"; }
                 ;;
             plain)
-                final="${base}.sql$(comp_ext)"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
+                final="${base}.sql$(comp_ext)"; tmp="$(dump_target "$final")"
                 log "dumping $name (pg plain, $CFG_COMPRESSION) -> $(basename "$final")"
                 pg_run pg_dump "${DUMPARGS[@]}" -Fp | compress_stream >"$tmp" \
                     || { rm -f "$tmp"; die "pg_dump failed for $name"; }
                 ;;
             directory)
                 local STAGEDIR="${CFG_BACKUP_DIR}/.staging"
-                mkdir -p "$STAGEDIR" || die "cannot create staging dir $STAGEDIR"
+                $DRY_RUN || mkdir -p "$STAGEDIR" || die "cannot create staging dir $STAGEDIR"
                 local dumpdir="${STAGEDIR}/${name}_${ts}.dir"
-                CLEAN_PATHS+=("$dumpdir")
-                final="${base}.dir.tar$(comp_ext)"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
+                $DRY_RUN || CLEAN_PATHS+=("$dumpdir")
+                final="${base}.dir.tar$(comp_ext)"; tmp="$(dump_target "$final")"
                 log "dumping $name (pg directory, -j $CTX_JOBS) -> $(basename "$final")"
                 DOCKER_EXTRA=(-v "$STAGEDIR":"$STAGEDIR" --user "$(id -u):$(id -g)")
                 pg_run pg_dump "${DUMPARGS[@]}" -Fd -j "$CTX_JOBS" -f "$dumpdir" \
@@ -895,7 +925,7 @@ backup_one() {
         esac
     else
         build_my_dump_args
-        final="${base}.sql$(comp_ext)"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
+        final="${base}.sql$(comp_ext)"; tmp="$(dump_target "$final")"
         log "dumping $name (mysqldump, $CFG_COMPRESSION) -> $(basename "$final")"
         my_run mysqldump "${DUMPARGS[@]}" | compress_stream >"$tmp" \
             || { rm -f "$tmp"; die "mysqldump failed for $name"; }
@@ -921,9 +951,11 @@ backup_one() {
 cmd_backup() {
     local -a names=()
     local target="${1:-all}"
+    (( $# <= 1 )) || die "backup takes one argument: 'all' or a comma-separated list (got: $*)"
     if [[ $target == all ]]; then mapfile -t names < <(cfgpy names "$CONFIG" databases)
     else IFS=',' read -r -a names <<<"$target"; fi
     [[ ${#names[@]} -gt 0 ]] || die "no databases configured"
+    sweep_stale_parts
 
     local n failed=0 okc=0 rc=0 t0=$SECONDS
     for n in "${names[@]}"; do
@@ -951,7 +983,7 @@ dump_globals() {  # expects a CTX_* pointing at one postgres server
     ts="$(date +"$CFG_TIMESTAMP_FORMAT")"
     host_tag="$(printf '%s' "${CTX_HOST}_${CTX_PORT}" | tr -c '[:alnum:]._-' '_')"
     final="${CFG_BACKUP_DIR}/globals_${host_tag}_postgres_globals_${ts}.sql$(comp_ext)"
-    tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
+    tmp="$(dump_target "$final")"
 
     local -a ga=(-h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" --globals-only --no-password)
     [[ -n $CTX_DB ]] && ga+=(-l "$CTX_DB")

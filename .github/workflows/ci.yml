@@ -190,6 +190,26 @@ jobs:
           rm -f "$trunc" "$trunc.meta.json" "$trunc.sha256"
           echo "verify correctly rejected the truncated dump"
 
+      - name: regression - a dry run must not write anything
+        run: |
+          mkdir -p "$RUNNER_TEMP/backups-dry"
+          sed "s#backup_dir: .*#backup_dir: $RUNNER_TEMP/backups-dry#" \
+              "$RUNNER_TEMP/dbtool.yml" > "$RUNNER_TEMP/dbtool-dry.yml"
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool-dry.yml" backup all -n -y
+          left=$(find "$RUNNER_TEMP/backups-dry" -type f ! -name '.dbtool.lock' | wc -l)
+          [ "$left" = "0" ] || { find "$RUNNER_TEMP/backups-dry" -type f; echo "::error::dry run wrote $left file(s)"; exit 1; }
+          echo "dry run left the directory clean"
+
+      - name: regression - an orphaned .part is swept, a stray argument is refused
+        run: |
+          touch "$RUNNER_TEMP/backups/ci_db_postgres_ci_db_20200101-000000.dump.part"
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" backup ci_db -y 2>&1 | grep -q 'removed orphaned'
+          [ -z "$(find "$RUNNER_TEMP/backups" -name '*.part')" ] || { echo "::error::.part survived"; exit 1; }
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" backup all globals -n -y; then
+            echo "::error::a stray positional argument was accepted"; exit 1
+          fi
+          echo "orphan swept and stray argument refused"
+
       - name: regression - concurrent runs must not overlap
         run: |
           # hold dbtool's own lock file from outside, so the race is deterministic
