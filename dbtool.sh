@@ -1157,9 +1157,39 @@ cmd_verify() {
     case "$f" in
         *.dump)
             CTX_ENGINE=postgres; CTX_PASS=""; CTX_SSLMODE=""
-            if have pg_restore; then PG_MODE=native; else PG_MODE=docker; PG_IMAGE="$PG_PROBE_IMAGE"; DOCKER_EXTRA=(-v "$fdir":"$fdir":ro); fi
-            local toc; toc="$(pg_run pg_restore -l "$f" 2>/dev/null | grep -c '^[0-9]' || true)"
-            [[ ${toc:-0} -gt 0 ]] && ok "valid PostgreSQL custom-format dump (${toc} TOC entries)" || die "not a readable custom-format dump" ;;
+            # The archive was written by a client matched to the source server, so a
+            # native pg_restore older than that server cannot read it. Take the version
+            # from the .meta.json sidecar and fall back to a matching container.
+            local want_maj="" nat=""
+            [[ -f "${f}.meta.json" ]] && want_maj="$(sed -n 's/.*"server_version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\).*/\1/p' "${f}.meta.json" | head -1)"
+            have pg_restore && nat="$(_native_major pg_restore || true)"
+            if [[ -n $nat && ( -z $want_maj || $nat -ge $want_maj ) ]]; then
+                PG_MODE=native
+            elif _docker_ok; then
+                PG_MODE=docker
+                PG_IMAGE="${want_maj:+postgres:${want_maj}-alpine}"
+                PG_IMAGE="${PG_IMAGE:-$PG_PROBE_IMAGE}"
+                DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
+                docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || {
+                    log "pulling $PG_IMAGE ..."
+                    docker pull -q "$PG_IMAGE" >/dev/null 2>&1 || {
+                        PG_IMAGE="postgres:${want_maj}"
+                        docker pull -q "$PG_IMAGE" >/dev/null 2>&1 || die "cannot pull a postgres:${want_maj} client image"
+                    }
+                }
+            elif [[ -n $nat ]]; then
+                PG_MODE=native
+                warn "local pg_restore $nat is older than the dump's server $want_maj — verify may fail"
+            else
+                die "no pg_restore and no usable docker — install postgresql-client or docker"
+            fi
+            # A dump of an empty database is valid but lists no selectable entries,
+            # so trust pg_restore's exit status and read the count from the header.
+            local lst toc
+            lst="$(pg_run pg_restore -l "$f" 2>/dev/null)" || die "not a readable custom-format dump"
+            toc="$(printf '%s\n' "$lst" | sed -n 's/^;[[:space:]]*TOC Entries:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+            [[ -n $toc ]] || toc="$(printf '%s\n' "$lst" | grep -c '^[0-9]' || true)"
+            ok "valid PostgreSQL custom-format dump (${toc:-0} TOC entries)" ;;
         *) test_archive "$f" && ok "archive integrity OK" ;;
     esac
 }
