@@ -77,7 +77,8 @@ Aliases are accepted where obvious (`username`/`uname`, `pass`/`passwd`, `db`/`d
 
 `defaults` controls `backup_dir`, `log_file`, `retention_days`, `retention_min_keep`,
 `compression` (`zstd|gzip|none`), `pg_compress_level`, `format` (`custom|plain|directory`),
-`jobs`, `docker` (`auto|always|never`), `docker_network`, `timeout`, `timestamp_format`.
+`jobs`, `docker` (`auto|always|never`), `docker_network`, `timeout`, `timestamp_format`,
+`verify` (`full|header|none`), `include_globals` and `lock`.
 
 `databases:` are backup sources; `targets:` are restore/migration destinations. The JSON file
 is byte-for-byte the same structure — use whichever you prefer.
@@ -86,17 +87,40 @@ is byte-for-byte the same structure — use whichever you prefer.
 
 ```bash
 dbtool test                                   # connect + print server versions
-dbtool backup all                             # everything enabled
-dbtool backup app_dev,crm_mysql           # a subset
+dbtool backup all                             # everything enabled, plus cluster globals
+dbtool backup app_dev,crm_mysql               # a subset
+dbtool globals                                # roles/grants only, one file per server
 dbtool list                                   # sources, targets, local dumps
-dbtool verify /backup/db/app_dev_*.dump    # checksum + real dump integrity
+dbtool verify /backup/db/app_dev_*.dump       # checksum + full dump read
 dbtool prune                                  # apply retention now
 ```
 
+Only one dbtool may work on a `backup_dir` at a time — a second run exits immediately instead
+of racing the first (`lock: false` disables it).
+
 Every dump lands as `<name>_<engine>_<db>_<timestamp>.<ext>` plus a `.sha256` and a
 `.meta.json` recording the source, server version, format and size. Dumps are written to a
-`.part` file and only renamed after they verify, so a half-finished dump can never be mistaken
-for a good one.
+`.part` file, and the rename happens only after the dump command exited 0 **and** the archive
+read back completely — `pg_restore -f /dev/null` for custom format, full decompression plus the
+writer's completion marker for plain SQL. Listing an archive header is not enough: a dump
+truncated by a timeout or a dropped connection still lists a complete table of contents. Set
+`verify: header` for the cheap check, or `verify: none` to skip it.
+
+## Roles and grants
+
+A per-database dump contains no roles, no cluster-level grants and no tablespaces, so restoring
+one onto a fresh server leaves every `GRANT` dangling. `dbtool globals` dumps them per server
+(deduplicated by host:port), and `backup all` includes them unless `include_globals: false`:
+
+```bash
+dbtool globals
+# -> globals_<host>_<port>_postgres_globals_<ts>.sql.zst   (mode 0600)
+zstd -dc /backup/db/globals_*.sql.zst | psql -h newhost -U postgres   # restore these first
+```
+
+Role password hashes live in `pg_authid`, which is superuser-only. When the configured user
+isn't a superuser dbtool warns and falls back to `--no-role-passwords` instead of failing —
+those roles restore without passwords, and you set them by hand.
 
 ## Restore
 
@@ -216,15 +240,8 @@ the containerised client exactly as it is from the host.
 - **Credentials never reach `ps`.** PostgreSQL uses `PGPASSWORD` in the process environment;
   MySQL gets a `0600` `--defaults-extra-file` in a private temp dir removed on exit.
 - **Dumps are as sensitive as the database.** `/backup/db` should be `0700` and owned by the
-  user running dbtool; enable the `s3:` block only against a bucket you control.
-- **Roles are not included.** Per-database dumps carry no cluster-level roles or grants. Take
-  those separately, and treat the output as secret — it contains password hashes unless you
-  pass `--no-role-passwords`:
-
-  ```bash
-  pg_dumpall -h db-primary.example.com -U postgres --globals-only > globals.sql
-  ```
-
+  user running dbtool; enable the `s3:` block only against a bucket you control. Globals files
+  are written `0600` because they can carry role password hashes.
 - Found a vulnerability? Open a private security advisory on GitHub rather than a public issue.
 
 ## Contributing

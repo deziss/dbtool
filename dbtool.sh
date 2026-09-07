@@ -409,6 +409,9 @@ CFG_DOCKER="auto"
 CFG_DOCKER_NETWORK="host"
 CFG_TIMEOUT=7200
 CFG_TIMESTAMP_FORMAT="%Y%m%d-%H%M%S"
+CFG_VERIFY="full"                 # full | header | none
+CFG_INCLUDE_GLOBALS=true          # dump cluster roles/grants alongside 'backup all'
+CFG_LOCK=true                     # refuse to run while another dbtool holds the lock
 
 PG_PROBE_IMAGE="${PG_PROBE_IMAGE:-postgres:17-alpine}"
 MY_PROBE_IMAGE="${MY_PROBE_IMAGE:-mysql:8.4}"
@@ -483,6 +486,18 @@ load_config() {
         gzip|none) : ;;
         *) warn "unknown compression '$CFG_COMPRESSION' — using gzip"; CFG_COMPRESSION=gzip ;;
     esac
+}
+
+# A nightly timer and a manual run must not dump or prune the same directory at
+# once: the loser can rename a .part the winner is still writing.
+acquire_lock() {
+    [[ ${CFG_LOCK:-true} == true ]] || return 0
+    have flock || { warn "flock not found — running without a lock"; return 0; }
+    LOCK_FILE="${CFG_BACKUP_DIR}/.dbtool.lock"
+    # Braces, not a bare `exec ... 2>/dev/null`: an exec without a command applies
+    # its redirections to the shell permanently, which would silence every warning.
+    { exec 9>"$LOCK_FILE"; } 2>/dev/null || { warn "cannot open $LOCK_FILE — running without a lock"; return 0; }
+    flock -n 9 || die "another dbtool run holds $LOCK_FILE — refusing to run concurrently"
 }
 
 # Copy a PREFIX_* entry into the CTX_* namespace the runners use.
@@ -771,6 +786,17 @@ build_my_dump_args() {  # populates DUMPARGS
     DUMPARGS+=(${CTX_INCLUDE[@]+"${CTX_INCLUDE[@]}"})
 }
 
+# Dumps are named <entry>_<engine>_<db>_<timestamp>.<ext>. Globbing "<entry>_*"
+# also matches a longer sibling entry (app_db vs app_db_archive), which made
+# --latest restore the wrong database and let prune delete the only copy of one.
+# Anchor on the engine token that always follows the entry name.
+backups_for() {  # backups_for <entry-name>  -> newest first, one path per line
+    find "$CFG_BACKUP_DIR" -maxdepth 1 -type f \
+         \( -name "$1_postgres_*" -o -name "$1_mysql_*" \) \
+         ! -name '*.sha256' ! -name '*.meta.json' ! -name '*.part' \
+         -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}'
+}
+
 # ===========================================================================
 #  BACKUP
 # ===========================================================================
@@ -795,6 +821,36 @@ write_meta() {  # write_meta <file> <engine> <serverver> <format>
 JSON
 }
 
+# pg_restore -l reads only the header and TOC, so it happily lists a dump whose
+# data section was cut short (connection dropped, timeout, full disk). Read the
+# whole archive unless the operator opts out.
+verify_dump_artifact() {  # verify_dump_artifact <file>
+    local f="$1" mode="${CFG_VERIFY:-full}" rc=0 tail_txt=""
+    [[ $mode == none ]] && { warn "integrity check skipped (verify: none): $(basename "$f")"; return 0; }
+    case "$f" in
+        *.dump)
+            local -a saved=(${DOCKER_EXTRA[@]+"${DOCKER_EXTRA[@]}"})
+            DOCKER_EXTRA=(-v "$(dirname "$f")":"$(dirname "$f")":ro)
+            if [[ $mode == header ]]; then pg_run pg_restore -l "$f" >/dev/null 2>&1 || rc=1
+            else                           pg_run pg_restore -f /dev/null "$f" >/dev/null 2>&1 || rc=1
+            fi
+            DOCKER_EXTRA=(${saved[@]+"${saved[@]}"})
+            return $rc ;;
+        *.sql|*.sql.*)
+            test_archive "$f" || return 1
+            [[ $mode == header ]] && return 0
+            # pg_dump -Fp and mysqldump both end with a completion marker; its
+            # absence means the writer died mid-stream.
+            tail_txt="$(decompress_stream "$f" 2>/dev/null | tail -5 || true)"
+            case "$tail_txt" in
+                *"PostgreSQL database dump complete"*|*"Dump completed"*|*"PostgreSQL database cluster dump complete"*) return 0 ;;
+                *) err "no dump-completion marker at the end of $(basename "$f") (truncated, or --skip-comments in dump_args)"
+                   return 1 ;;
+            esac ;;
+        *) test_archive "$f" || return 1; return 0 ;;
+    esac
+}
+
 backup_one() {
     local name="$1"
     load_entry databases "$name" SRC_
@@ -812,21 +868,28 @@ backup_one() {
             custom)
                 final="${base}.dump"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
                 log "dumping $name (pg custom, level $CFG_PG_COMPRESS_LEVEL) -> $(basename "$final")"
-                pg_run pg_dump "${DUMPARGS[@]}" -Fc -Z "$CFG_PG_COMPRESS_LEVEL" >"$tmp"
+                pg_run pg_dump "${DUMPARGS[@]}" -Fc -Z "$CFG_PG_COMPRESS_LEVEL" >"$tmp" \
+                    || { rm -f "$tmp"; die "pg_dump failed for $name"; }
                 ;;
             plain)
                 final="${base}.sql$(comp_ext)"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
                 log "dumping $name (pg plain, $CFG_COMPRESSION) -> $(basename "$final")"
-                pg_run pg_dump "${DUMPARGS[@]}" -Fp | compress_stream >"$tmp"
+                pg_run pg_dump "${DUMPARGS[@]}" -Fp | compress_stream >"$tmp" \
+                    || { rm -f "$tmp"; die "pg_dump failed for $name"; }
                 ;;
             directory)
-                local dumpdir="${RUNDIR}/${name}_${ts}.dir"
+                local STAGEDIR="${CFG_BACKUP_DIR}/.staging"
+                mkdir -p "$STAGEDIR" || die "cannot create staging dir $STAGEDIR"
+                local dumpdir="${STAGEDIR}/${name}_${ts}.dir"
+                CLEAN_PATHS+=("$dumpdir")
                 final="${base}.dir.tar$(comp_ext)"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
                 log "dumping $name (pg directory, -j $CTX_JOBS) -> $(basename "$final")"
-                DOCKER_EXTRA=(-v "$RUNDIR":"$RUNDIR" --user "$(id -u):$(id -g)")
-                pg_run pg_dump "${DUMPARGS[@]}" -Fd -j "$CTX_JOBS" -f "$dumpdir"
+                DOCKER_EXTRA=(-v "$STAGEDIR":"$STAGEDIR" --user "$(id -u):$(id -g)")
+                pg_run pg_dump "${DUMPARGS[@]}" -Fd -j "$CTX_JOBS" -f "$dumpdir" \
+                    || { DOCKER_EXTRA=(); rm -f "$tmp"; die "pg_dump failed for $name"; }
                 DOCKER_EXTRA=()
-                $DRY_RUN || tar -C "$RUNDIR" -cf - "$(basename "$dumpdir")" | compress_stream >"$tmp"
+                $DRY_RUN || tar -C "$STAGEDIR" -cf - "$(basename "$dumpdir")" | compress_stream >"$tmp" \
+                    || { rm -f "$tmp"; die "packing the directory dump failed for $name"; }
                 ;;
             *) die "unknown postgres format '$CTX_FORMAT' (custom|plain|directory)" ;;
         esac
@@ -834,7 +897,8 @@ backup_one() {
         build_my_dump_args
         final="${base}.sql$(comp_ext)"; tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
         log "dumping $name (mysqldump, $CFG_COMPRESSION) -> $(basename "$final")"
-        my_run mysqldump "${DUMPARGS[@]}" | compress_stream >"$tmp"
+        my_run mysqldump "${DUMPARGS[@]}" | compress_stream >"$tmp" \
+            || { rm -f "$tmp"; die "mysqldump failed for $name"; }
     fi
 
     $DRY_RUN && { ok "dry-run: $name"; return 0; }
@@ -842,22 +906,14 @@ backup_one() {
     mv "$tmp" "$final"
     chmod 640 "$final"
 
-    # verify
-    if [[ $final == *.dump ]]; then
-        pg_run pg_restore -l "$final" >/dev/null 2>&1 || {
-            DOCKER_EXTRA=(-v "$CFG_BACKUP_DIR":"$CFG_BACKUP_DIR":ro)
-            pg_run pg_restore -l "$final" >/dev/null || { DOCKER_EXTRA=(); die "dump verification failed: $final"; }
-            DOCKER_EXTRA=()
-        }
-    else
-        test_archive "$final" || die "archive verification failed: $final"
-    fi
+    verify_dump_artifact "$final" || { rm -f "$final"; die "integrity check failed — discarded $(basename "$final")"; }
 
     write_meta "$final" "$CTX_ENGINE" "${PG_SERVER_VER:-$MY_SERVER_VER}" "$CTX_FORMAT"
     elapsed=$((SECONDS - start))
     size="$(stat -c %s "$final" 2>/dev/null || stat -f %z "$final")"
     ok "$name -> $(basename "$final")  $(human "$size")  in ${elapsed}s"
     upload_file "$final"
+    upload_file "${final}.sha256"
     upload_file "${final}.meta.json"
     printf '%s' "$final" >"$RUNDIR/last_backup"
 }
@@ -869,14 +925,76 @@ cmd_backup() {
     else IFS=',' read -r -a names <<<"$target"; fi
     [[ ${#names[@]} -gt 0 ]] || die "no databases configured"
 
-    local n failed=0 okc=0 t0=$SECONDS
+    local n failed=0 okc=0 rc=0 t0=$SECONDS
     for n in "${names[@]}"; do
         [[ -z $n ]] && continue
-        if ( backup_one "$n" ); then okc=$((okc+1)); else failed=$((failed+1)); err "backup failed: $n"; fi
+        # `set -e` inside the subshell: running it as a plain conditional would
+        # suppress errexit there and let a failed dump fall through as success.
+        rc=0; ( set -e; backup_one "$n" ) || rc=$?
+        if (( rc == 0 )); then okc=$((okc+1)); else failed=$((failed+1)); err "backup failed: $n"; fi
     done
+    if [[ $target == all && ${CFG_INCLUDE_GLOBALS:-true} == true ]]; then
+        rc=0; ( set -e; cmd_globals ) || rc=$?
+        (( rc == 0 )) || { failed=$((failed+1)); err "globals dump failed"; }
+    fi
     prune_backups
     log "summary: ${okc} succeeded, ${failed} failed, $((SECONDS - t0))s total"
     if (( failed > 0 )); then notify_failure "$failed database backup(s) failed on $(hostname)"; return 1; fi
+}
+
+# ===========================================================================
+#  GLOBALS  (cluster roles and grants — not part of any per-database dump)
+# ===========================================================================
+dump_globals() {  # expects a CTX_* pointing at one postgres server
+    resolve_pg_client
+    local ts host_tag final tmp su size
+    ts="$(date +"$CFG_TIMESTAMP_FORMAT")"
+    host_tag="$(printf '%s' "${CTX_HOST}_${CTX_PORT}" | tr -c '[:alnum:]._-' '_')"
+    final="${CFG_BACKUP_DIR}/globals_${host_tag}_postgres_globals_${ts}.sql$(comp_ext)"
+    tmp="${final}.part"; CLEAN_PATHS+=("$tmp")
+
+    local -a ga=(-h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" --globals-only --no-password)
+    [[ -n $CTX_DB ]] && ga+=(-l "$CTX_DB")
+    # pg_authid is superuser-only; without it pg_dumpall aborts instead of
+    # falling back, so ask pg_roles for the answer first.
+    su="$(_pg_query "$CTX_DB" "SELECT rolsuper FROM pg_roles WHERE rolname=current_user")"
+    if [[ $su != t ]]; then
+        warn "'$CTX_USER' is not superuser on ${CTX_HOST}:${CTX_PORT} — globals dumped without role passwords"
+        ga+=(--no-role-passwords)
+    fi
+
+    log "dumping globals from ${CTX_HOST}:${CTX_PORT}"
+    $DRY_RUN && { ok "dry-run: globals ${CTX_HOST}:${CTX_PORT}"; return 0; }
+    pg_run pg_dumpall "${ga[@]}" | compress_stream >"$tmp" \
+        || { rm -f "$tmp"; die "pg_dumpall failed for ${CTX_HOST}:${CTX_PORT}"; }
+    [[ -s $tmp ]] || { rm -f "$tmp"; die "globals dump is empty for ${CTX_HOST}:${CTX_PORT}"; }
+    mv "$tmp" "$final"
+    chmod 600 "$final"          # may contain role password hashes
+    verify_dump_artifact "$final" || { rm -f "$final"; die "integrity check failed — discarded $(basename "$final")"; }
+    decompress_stream "$final" | grep -q 'CREATE ROLE' || warn "no CREATE ROLE statements in $(basename "$final")"
+
+    CTX_LABEL="globals@${CTX_HOST}:${CTX_PORT}"
+    write_meta "$final" postgres "$PG_SERVER_VER" globals
+    size="$(stat -c %s "$final" 2>/dev/null || stat -f %z "$final")"
+    ok "globals ${CTX_HOST}:${CTX_PORT} -> $(basename "$final")  $(human "$size")"
+    upload_file "$final"; upload_file "${final}.sha256"; upload_file "${final}.meta.json"
+}
+
+cmd_globals() {
+    local -a names=(); mapfile -t names < <(cfgpy names "$CONFIG" databases)
+    local -A seen=(); local n key rc=0
+    for n in ${names[@]+"${names[@]}"}; do
+        [[ -z $n ]] && continue
+        load_entry databases "$n" G_
+        [[ "$(gv G_ENGINE)" == postgres ]] || continue
+        key="$(gv G_HOST):$(gv G_PORT)"
+        [[ -n ${seen[$key]:-} ]] && continue
+        seen[$key]=1
+        local r=0; ( set -e; use_ctx G_; dump_globals ) || r=$?
+        (( r == 0 )) || { rc=1; err "globals failed: $key"; }
+    done
+    (( ${#seen[@]} > 0 )) || warn "no postgres sources configured — nothing to dump"
+    return $rc
 }
 
 # ===========================================================================
@@ -886,11 +1004,17 @@ prune_backups() {
     local days="${CFG_RETENTION_DAYS:-0}" keep="${CFG_RETENTION_MIN_KEEP:-0}"
     (( days > 0 )) || return 0
     local -a names=(); mapfile -t names < <(cfgpy names "$CONFIG" databases)
+    # globals dumps belong to a server, not to a database entry, but they follow
+    # the same naming scheme so the same retention applies.
+    local -a gnames=()
+    mapfile -t gnames < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f -name 'globals_*_postgres_globals_*' \
+                          -printf '%f\n' 2>/dev/null | sed 's/_postgres_globals_.*$//' | sort -u)
+    names+=(${gnames[@]+"${gnames[@]}"})
     local n f removed=0
-    for n in "${names[@]}"; do
+    for n in ${names[@]+"${names[@]}"}; do
+        [[ -z $n ]] && continue
         local -a files=()
-        mapfile -t files < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f -name "${n}_*" \
-                             ! -name '*.sha256' ! -name '*.meta.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
+        mapfile -t files < <(backups_for "$n")
         local idx=0
         for f in ${files[@]+"${files[@]}"}; do
             idx=$((idx+1))
@@ -909,10 +1033,7 @@ prune_backups() {
 # ===========================================================================
 #  RESTORE
 # ===========================================================================
-latest_backup_for() {
-    find "$CFG_BACKUP_DIR" -maxdepth 1 -type f -name "$1_*" ! -name '*.sha256' ! -name '*.meta.json' \
-        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}'
-}
+latest_backup_for() { backups_for "$1" | head -1; }
 
 pg_db_exists() { [[ "$(_pg_query postgres "SELECT 1 FROM pg_database WHERE datname='${CTX_DB}'")" == 1 ]]; }
 
@@ -1148,49 +1269,56 @@ cmd_list() {
     printf '\n'
 }
 
+# Pick a pg client that can actually read this archive: it was written by a
+# client matched to the source server, and an older pg_restore cannot read it.
+pick_pg_client_for_dump() {  # pick_pg_client_for_dump <file>
+    local f="$1" fdir want_maj="" nat=""
+    fdir="$(dirname "$f")"
+    [[ -f "${f}.meta.json" ]] && want_maj="$(sed -n 's/.*"server_version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\).*/\1/p' "${f}.meta.json" | head -1)"
+    have pg_restore && nat="$(_native_major pg_restore || true)"
+    if [[ -n $nat && ( -z $want_maj || $nat -ge $want_maj ) ]]; then
+        PG_MODE=native; return 0
+    fi
+    if _docker_ok; then
+        PG_MODE=docker
+        PG_IMAGE="${want_maj:+postgres:${want_maj}-alpine}"
+        PG_IMAGE="${PG_IMAGE:-$PG_PROBE_IMAGE}"
+        DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
+        docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || {
+            log "pulling $PG_IMAGE ..."
+            docker pull -q "$PG_IMAGE" >/dev/null 2>&1 || {
+                PG_IMAGE="postgres:${want_maj}"
+                docker pull -q "$PG_IMAGE" >/dev/null 2>&1 || die "cannot pull a postgres:${want_maj} client image"
+            }
+        }
+        return 0
+    fi
+    [[ -n $nat ]] || die "no pg_restore and no usable docker — install postgresql-client or docker"
+    PG_MODE=native
+    warn "local pg_restore $nat is older than the dump's server ${want_maj:-?} — verify may fail"
+}
+
 cmd_verify() {
-    local f="$1"; [[ -f $f ]] || die "no such file: $f"
+    local f="${1:-}"; [[ -n $f && -f $f ]] || die "usage: $SCRIPT_NAME verify <file>"
     local fdir; fdir="$(cd "$(dirname "$f")" && pwd)"
+    f="${fdir}/$(basename "$f")"
     if [[ -f "${f}.sha256" ]]; then
         ( cd "$fdir" && sha256sum -c "$(basename "$f").sha256" ) || die "checksum failed"
     else warn "no .sha256 sidecar for $(basename "$f")"; fi
     case "$f" in
         *.dump)
             CTX_ENGINE=postgres; CTX_PASS=""; CTX_SSLMODE=""
-            # The archive was written by a client matched to the source server, so a
-            # native pg_restore older than that server cannot read it. Take the version
-            # from the .meta.json sidecar and fall back to a matching container.
-            local want_maj="" nat=""
-            [[ -f "${f}.meta.json" ]] && want_maj="$(sed -n 's/.*"server_version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\).*/\1/p' "${f}.meta.json" | head -1)"
-            have pg_restore && nat="$(_native_major pg_restore || true)"
-            if [[ -n $nat && ( -z $want_maj || $nat -ge $want_maj ) ]]; then
-                PG_MODE=native
-            elif _docker_ok; then
-                PG_MODE=docker
-                PG_IMAGE="${want_maj:+postgres:${want_maj}-alpine}"
-                PG_IMAGE="${PG_IMAGE:-$PG_PROBE_IMAGE}"
-                DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
-                docker image inspect "$PG_IMAGE" >/dev/null 2>&1 || {
-                    log "pulling $PG_IMAGE ..."
-                    docker pull -q "$PG_IMAGE" >/dev/null 2>&1 || {
-                        PG_IMAGE="postgres:${want_maj}"
-                        docker pull -q "$PG_IMAGE" >/dev/null 2>&1 || die "cannot pull a postgres:${want_maj} client image"
-                    }
-                }
-            elif [[ -n $nat ]]; then
-                PG_MODE=native
-                warn "local pg_restore $nat is older than the dump's server $want_maj — verify may fail"
-            else
-                die "no pg_restore and no usable docker — install postgresql-client or docker"
-            fi
-            # A dump of an empty database is valid but lists no selectable entries,
-            # so trust pg_restore's exit status and read the count from the header.
-            local lst toc
-            lst="$(pg_run pg_restore -l "$f" 2>/dev/null)" || die "not a readable custom-format dump"
-            toc="$(printf '%s\n' "$lst" | sed -n 's/^;[[:space:]]*TOC Entries:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
-            [[ -n $toc ]] || toc="$(printf '%s\n' "$lst" | grep -c '^[0-9]' || true)"
-            ok "valid PostgreSQL custom-format dump (${toc:-0} TOC entries)" ;;
-        *) test_archive "$f" && ok "archive integrity OK" ;;
+            pick_pg_client_for_dump "$f"
+            verify_dump_artifact "$f" \
+                || die "unreadable custom-format dump — header may list fine while the data section is truncated"
+            local toc
+            DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
+            toc="$(pg_run pg_restore -l "$f" 2>/dev/null | sed -n 's/^;[[:space:]]*TOC Entries:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+            DOCKER_EXTRA=()
+            ok "valid PostgreSQL custom-format dump (${toc:-?} TOC entries, ${CFG_VERIFY:-full} check)" ;;
+        *)
+            verify_dump_artifact "$f" || die "integrity check failed: $(basename "$f")"
+            ok "archive integrity OK (${CFG_VERIFY:-full} check)" ;;
     esac
 }
 
@@ -1242,9 +1370,10 @@ COMMANDS
           [--database DB] [--create] [--drop]
   migrate --from SRC --to TGT    Stream a database to another server
           [--target-db DB] [--create] [--drop] [--via-file]
+  globals                        Dump cluster roles/grants for every postgres server
   list                           Show configured sources, targets and local backups
   prune                          Apply the retention policy now
-  verify FILE                    Check checksum + archive/dump integrity
+  verify FILE                    Check checksum + full archive/dump integrity
   test                           Connectivity + version check for every entry
   parse-url URL [PREFIX]         Print shell vars parsed from a DATABASE_URL
 
@@ -1293,11 +1422,12 @@ main() {
     if [[ $cmd == parse-url ]]; then cmd_parse_url ${rest[@]+"${rest[@]}"}; exit $?; fi
     load_config
     case "$cmd" in
-        backup)  cmd_backup ${rest[@]+"${rest[@]}"} ;;
+        backup)  acquire_lock; cmd_backup ${rest[@]+"${rest[@]}"} ;;
+        globals) acquire_lock; cmd_globals ;;
         restore) cmd_restore ${rest[@]+"${rest[@]}"} ;;
         migrate) cmd_migrate ${rest[@]+"${rest[@]}"} ;;
         list)    cmd_list ;;
-        prune)   prune_backups ;;
+        prune)   acquire_lock; prune_backups ;;
         verify)  cmd_verify ${rest[@]+"${rest[@]}"} ;;
         test)    cmd_test ;;
         *) die "unknown command: $cmd (see -h)" ;;

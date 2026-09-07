@@ -13,7 +13,10 @@
     "docker": "auto",
     "docker_network": "host",
     "timeout": 7200,
-    "timestamp_format": "%Y%m%d-%H%M%S"
+    "timestamp_format": "%Y%m%d-%H%M%S",
+    "verify": "full",
+    "include_globals": true,
+    "lock": true
   },
 
   "s3": {

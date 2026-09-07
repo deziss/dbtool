@@ -93,6 +93,15 @@ jobs:
               user: postgres
               password: ci_password
               database: ci_db
+            # entry name of which "ci_db" is a strict prefix: the old glob
+            # "ci_db_*" matched this one's dumps too
+            - name: ci_db_extra
+              engine: postgres
+              host: 127.0.0.1
+              port: 5432
+              user: postgres
+              password: ci_password
+              database: ci_db
           targets:
             ci_restore:
               engine: postgres
@@ -110,6 +119,9 @@ jobs:
         run: |
           psql -h 127.0.0.1 -U postgres -d ci_db -c \
             "create table t(id serial primary key, v text); insert into t(v) select 'row'||g from generate_series(1,1000) g;"
+          # big enough that a 1s timeout always cuts the dump in half
+          psql -h 127.0.0.1 -U postgres -d ci_db -c \
+            "create table big(id int, v text); insert into big select g, md5(g::text)||md5((g+1)::text) from generate_series(1,800000) g;"
 
       - name: test / backup / verify / restore / prune
         run: |
@@ -127,3 +139,67 @@ jobs:
           n=$(psql -h 127.0.0.1 -U postgres -d ci_restored -Atc 'select count(*) from t')
           echo "restored rows: $n"
           [ "$n" = "1000" ]
+
+      - name: cluster globals are dumped
+        run: |
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" globals
+          f=$(ls "$RUNNER_TEMP"/backups/globals_*_postgres_globals_*.sql* | head -1)
+          echo "globals: $f"
+          case "$f" in *.zst) zstd -dc "$f";; *.gz) gzip -dc "$f";; *) cat "$f";; esac | grep -q 'CREATE ROLE'
+          [ "$(stat -c %a "$f")" = "600" ]
+
+      - name: regression - --latest must not match a longer sibling entry
+        run: |
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" backup ci_db -y
+          sleep 1
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" backup ci_db_extra -y   # newer than ci_db's
+          picked=$(./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" restore --latest ci_db \
+                     -t ci_restore -n -y | sed -n 's/.*latest: //p' | head -1)
+          echo "picked: $picked"
+          case "$picked" in
+            ci_db_postgres_*) echo "correct dump chosen" ;;
+            *) echo "::error::--latest ci_db picked $picked"; exit 1 ;;
+          esac
+
+      - name: regression - a truncated dump must be rejected, not renamed
+        run: |
+          mkdir -p "$RUNNER_TEMP/backups-t"
+          sed -e "s#backup_dir: .*#backup_dir: $RUNNER_TEMP/backups-t#" \
+              -e "s#^  timeout:.*##" \
+              -e "s#^  docker: auto#  docker: auto\n  timeout: 1#" \
+              "$RUNNER_TEMP/dbtool.yml" > "$RUNNER_TEMP/dbtool-timeout.yml"
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool-timeout.yml" backup ci_db -y; then
+            echo "::error::a dump killed by the 1s timeout was reported as success"; exit 1
+          fi
+          if ls "$RUNNER_TEMP"/backups-t/*.dump 2>/dev/null; then
+            echo "::error::a truncated dump was renamed into place"; exit 1
+          fi
+          echo "timed-out dump correctly failed and left nothing behind"
+
+      - name: regression - verify must read the whole archive, not just the header
+        run: |
+          good=$(ls -t "$RUNNER_TEMP"/backups/ci_db_postgres_*.dump | head -1)
+          trunc="$RUNNER_TEMP/backups/trunc_postgres_ci_db_20200101-000000.dump"
+          head -c 200000 "$good" > "$trunc"
+          cp "$good.meta.json" "$trunc.meta.json"
+          ( cd "$RUNNER_TEMP/backups" && sha256sum "$(basename "$trunc")" > "$(basename "$trunc").sha256" )
+          pg_restore -l "$trunc" > /dev/null && echo "header alone still lists this truncated dump"
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" verify "$trunc"; then
+            echo "::error::verify accepted a truncated dump"; exit 1
+          fi
+          rm -f "$trunc" "$trunc.meta.json" "$trunc.sha256"
+          echo "verify correctly rejected the truncated dump"
+
+      - name: regression - concurrent runs must not overlap
+        run: |
+          # hold dbtool's own lock file from outside, so the race is deterministic
+          flock -x "$RUNNER_TEMP/backups/.dbtool.lock" sleep 15 &
+          holder=$!
+          sleep 2
+          st=0
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" backup ci_db -y > "$RUNNER_TEMP/lock.log" 2>&1 || st=$?
+          cat "$RUNNER_TEMP/lock.log"
+          kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+          [ "$st" != "0" ] || { echo "::error::dbtool ran while the lock was held"; exit 1; }
+          grep -q 'refusing to run concurrently' "$RUNNER_TEMP/lock.log"
+          echo "second run was refused while the lock was held"

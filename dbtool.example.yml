@@ -23,6 +23,9 @@ defaults:
   docker_network: host
   timeout: 7200                     # seconds, per dump/restore
   timestamp_format: "%Y%m%d-%H%M%S"
+  verify: full                      # full | header | none — full reads the whole archive back
+  include_globals: true             # 'backup all' also dumps cluster roles/grants per server
+  lock: true                        # refuse to run while another dbtool holds the backup_dir
 
 # Optional off-box copy via MinIO client (mc) or awscli
 s3:
