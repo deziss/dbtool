@@ -190,6 +190,36 @@ jobs:
           rm -f "$trunc" "$trunc.meta.json" "$trunc.sha256"
           echo "verify correctly rejected the truncated dump"
 
+      - name: regression - a failed probe must report why
+        run: |
+          cat > "$RUNNER_TEMP/dbtool-bad.yml" <<YML
+          defaults:
+            backup_dir: $RUNNER_TEMP/backups
+            docker: never
+          databases:
+            - name: refused
+              engine: postgres
+              host: 127.0.0.1
+              port: 5999
+              user: postgres
+              password: ci_password
+              database: ci_db
+            - name: badpass
+              engine: postgres
+              host: 127.0.0.1
+              port: 5432
+              user: postgres
+              password: definitely_wrong
+              database: ci_db
+          YML
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool-bad.yml" test > "$RUNNER_TEMP/probe.log" 2>&1 || true
+          cat "$RUNNER_TEMP/probe.log"
+          grep -q 'Connection refused' "$RUNNER_TEMP/probe.log" \
+            || { echo "::error::a refused connection was not reported as such"; exit 1; }
+          grep -qi 'password authentication failed' "$RUNNER_TEMP/probe.log" \
+            || { echo "::error::a bad password was not reported as such"; exit 1; }
+          echo "probe failures name their cause"
+
       - name: regression - a dry run must not write anything
         run: |
           mkdir -p "$RUNNER_TEMP/backups-dry"

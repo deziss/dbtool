@@ -418,6 +418,11 @@ MY_PROBE_IMAGE="${MY_PROBE_IMAGE:-mysql:8.4}"
 
 RUNDIR="$(mktemp -d "${TMPDIR:-/tmp}/dbtool.XXXXXXXX")"
 PY="$RUNDIR/cfg.py"
+# Fixed paths, set once in the parent: _pg_query runs inside a command
+# substitution, so anything it assigns to a variable — including the name of a
+# file — is gone by the time the caller looks.
+PG_ERR_FILE="$RUNDIR/pg.lasterr"
+MY_ERR_FILE="$RUNDIR/my.lasterr"
 MY_CNF="$RUNDIR/my.cnf"
 declare -a DOCKER_EXTRA=()
 declare -a CLEAN_PATHS=()
@@ -532,34 +537,59 @@ load_entry() { eval "$(cfgpy entry "$CONFIG" "$1" "$2" "$3")"; }
 #  Client resolution (native vs version-matched docker image)
 # ===========================================================================
 PG_MODE=""; PG_IMAGE=""; PG_SERVER_VER=""; PG_SERVER_MAJOR=""
+# Text of the last failed probe. "Connection refused", "password authentication
+# failed" and "database does not exist" need different fixes, so never swallow
+# them. It goes through a file, not a variable: every caller reads the probe with
+# v="$(_pg_query ...)", which runs the function in a subshell whose variables die
+# with it.
+probe_err() {  # probe_err <file> <fallback>
+    if [[ -n ${1:-} && -s ${1:-} ]]; then tr -d '\000' <"$1"; else printf '%s' "${2:-no error text from the client}"; fi
+}
+pg_err() { probe_err "${PG_ERR_FILE:-}" "no error text from psql (is it installed? try docker: always)"; }
+my_err() { probe_err "${MY_ERR_FILE:-}" "no error text from mysql (is it installed? try docker: always)"; }
 MY_MODE=""; MY_IMAGE=""; MY_SERVER_VER=""; MY_SERVER_MAJOR=""; MY_FLAVOR="mysql"
 
 _docker_ok() { have docker && docker info >/dev/null 2>&1; }
 
 _pg_query() {  # _pg_query <dbname> <sql>  -> value on stdout, via any available client
-    local db="$1" sql="$2" out=""
+    local db="$1" sql="$2" out="" errf="$RUNDIR/pg.err"
+    : >"$errf" 2>/dev/null || true; : >"$PG_ERR_FILE" 2>/dev/null || true
     if have psql; then
         out="$(env PGPASSWORD="$CTX_PASS" ${CTX_SSLMODE:+PGSSLMODE="$CTX_SSLMODE"} PGCONNECT_TIMEOUT=10 \
-              psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" -tAX -c "$sql" 2>/dev/null)" || out=""
+              psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" -tAX -c "$sql" 2>>"$errf")" || out=""
     fi
     if [[ -z $out ]] && _docker_ok; then
         out="$(docker run --rm --network "$CFG_DOCKER_NETWORK" \
               -e PGPASSWORD="$CTX_PASS" ${CTX_SSLMODE:+-e PGSSLMODE="$CTX_SSLMODE"} -e PGCONNECT_TIMEOUT=10 \
-              "$PG_PROBE_IMAGE" psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" -tAX -c "$sql" 2>/dev/null)" || out=""
+              "$PG_PROBE_IMAGE" psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" -tAX -c "$sql" 2>>"$errf")" || out=""
     fi
+    if [[ -z $out && -s $errf ]]; then
+        # psql retries SSL then plaintext and prints the same failure twice
+        sed -e 's/^psql: *//' -e 's/^error: *//' -e '/^$/d' "$errf" | tr '\t' ' ' \
+            | awk '!seen[$0]++' | tail -2 | tr '\n' ' ' | sed 's/  */ /g;s/ *$//' \
+            >"$PG_ERR_FILE" 2>/dev/null || true
+    fi
+    rm -f "$errf"
     printf '%s' "$(printf '%s' "$out" | tr -d '[:space:]')"
 }
 
 _my_query() {  # _my_query <sql>
     write_my_cnf
-    local out=""
+    local out="" errf="$RUNDIR/my.err"
+    : >"$errf" 2>/dev/null || true; : >"$MY_ERR_FILE" 2>/dev/null || true
     if have mysql; then
-        out="$(mysql --defaults-extra-file="$MY_CNF" --connect-timeout=10 -N -B -e "$1" 2>/dev/null)" || out=""
+        out="$(mysql --defaults-extra-file="$MY_CNF" --connect-timeout=10 -N -B -e "$1" 2>>"$errf")" || out=""
     fi
     if [[ -z $out ]] && _docker_ok; then
         out="$(docker run --rm --network "$CFG_DOCKER_NETWORK" -v "$MY_CNF":/tmp/dbtool.cnf:ro \
-              "$MY_PROBE_IMAGE" mysql --defaults-extra-file=/tmp/dbtool.cnf --connect-timeout=10 -N -B -e "$1" 2>/dev/null)" || out=""
+              "$MY_PROBE_IMAGE" mysql --defaults-extra-file=/tmp/dbtool.cnf --connect-timeout=10 -N -B -e "$1" 2>>"$errf")" || out=""
     fi
+    if [[ -z $out && -s $errf ]]; then
+        grep -v '^$' "$errf" | grep -v 'Using a password on the command line' | tr '\t' ' ' \
+            | awk '!seen[$0]++' | tail -2 | tr '\n' ' ' | sed 's/  */ /g;s/ *$//' \
+            >"$MY_ERR_FILE" 2>/dev/null || true
+    fi
+    rm -f "$errf"
     printf '%s' "$(printf '%s' "$out" | tr -d '[:space:]')"
 }
 
@@ -573,7 +603,7 @@ _native_major() {  # _native_major <binary>  -> major version of local client
 resolve_pg_client() {
     PG_SERVER_VER="$(_pg_query "$CTX_DB" 'SHOW server_version')"
     [[ -n $PG_SERVER_VER ]] || PG_SERVER_VER="$(_pg_query postgres 'SHOW server_version')"
-    [[ -n $PG_SERVER_VER ]] || die "cannot reach PostgreSQL at $CTX_HOST:$CTX_PORT as '$CTX_USER' (check host/port/user/password/pg_hba)"
+    [[ -n $PG_SERVER_VER ]] || die "cannot reach PostgreSQL at $CTX_HOST:$CTX_PORT as '$CTX_USER': $(pg_err)"
     PG_SERVER_VER="${PG_SERVER_VER%%(*}"
     local maj="${PG_SERVER_VER%%.*}"
     (( maj < 10 )) && maj="$(printf '%s' "$PG_SERVER_VER" | cut -d. -f1,2)"
@@ -611,7 +641,7 @@ resolve_pg_client() {
 
 resolve_my_client() {
     MY_SERVER_VER="$(_my_query 'SELECT VERSION()')"
-    [[ -n $MY_SERVER_VER ]] || die "cannot reach MySQL/MariaDB at $CTX_HOST:$CTX_PORT as '$CTX_USER' (check host/port/user/password/grants)"
+    [[ -n $MY_SERVER_VER ]] || die "cannot reach MySQL/MariaDB at $CTX_HOST:$CTX_PORT as '$CTX_USER': $(my_err)"
     local majmin="${MY_SERVER_VER%%-*}"
     majmin="$(printf '%s' "$majmin" | cut -d. -f1,2)"
     MY_SERVER_MAJOR="${majmin%%.*}"
@@ -1361,10 +1391,10 @@ cmd_test() {
         load_entry databases "$n" SRC_; use_ctx SRC_
         if [[ $CTX_ENGINE == postgres ]]; then
             local v; v="$(_pg_query "$CTX_DB" 'SHOW server_version')"
-            [[ -n $v ]] && ok "$n: postgres $v at $CTX_HOST:$CTX_PORT/$CTX_DB" || { err "$n: connection FAILED"; rc=1; }
+            [[ -n $v ]] && ok "$n: postgres $v at $CTX_HOST:$CTX_PORT/$CTX_DB" || { err "$n: connection FAILED — $(pg_err)"; rc=1; }
         else
             local v; v="$(_my_query 'SELECT VERSION()')"
-            [[ -n $v ]] && ok "$n: mysql $v at $CTX_HOST:$CTX_PORT/$CTX_DB" || { err "$n: connection FAILED"; rc=1; }
+            [[ -n $v ]] && ok "$n: mysql $v at $CTX_HOST:$CTX_PORT/$CTX_DB" || { err "$n: connection FAILED — $(my_err)"; rc=1; }
         fi
     done < <(cfgpy names "$CONFIG" databases)
     while read -r n; do
@@ -1372,10 +1402,10 @@ cmd_test() {
         load_entry targets "$n" DST_; use_ctx DST_
         if [[ $CTX_ENGINE == postgres ]]; then
             local v; v="$(_pg_query postgres 'SHOW server_version')"
-            [[ -n $v ]] && ok "target $n: postgres $v at $CTX_HOST:$CTX_PORT" || { err "target $n: connection FAILED"; rc=1; }
+            [[ -n $v ]] && ok "target $n: postgres $v at $CTX_HOST:$CTX_PORT" || { err "target $n: connection FAILED — $(pg_err)"; rc=1; }
         else
             local v; v="$(_my_query 'SELECT VERSION()')"
-            [[ -n $v ]] && ok "target $n: mysql $v at $CTX_HOST:$CTX_PORT" || { err "target $n: connection FAILED"; rc=1; }
+            [[ -n $v ]] && ok "target $n: mysql $v at $CTX_HOST:$CTX_PORT" || { err "target $n: connection FAILED — $(my_err)"; rc=1; }
         fi
     done < <(cfgpy names "$CONFIG" targets 2>/dev/null || true)
     return $rc
