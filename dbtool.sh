@@ -322,10 +322,14 @@ def build_entry(entry):
         'CREATE_DB': entry.get('create', False),
         'IMAGE': entry.get('image') or '',
         'ENABLED': entry.get('enabled', True),
+        # treat this entry as a whole server: enumerate its databases at run time
+        'ALL_DATABASES': entry.get('all_databases',
+                         entry.get('include_all', entry.get('all_dbs', entry.get('all', False)))),
     }
     for key, name in (('exclude_tables', 'EXCLUDE'), ('include_tables', 'INCLUDE'),
                       ('exclude_schemas', 'EXCLUDE_SCHEMA'), ('schemas', 'SCHEMA'),
-                      ('dump_args', 'DUMP_ARGS'), ('restore_args', 'RESTORE_ARGS')):
+                      ('dump_args', 'DUMP_ARGS'), ('restore_args', 'RESTORE_ARGS'),
+                      ('exclude_databases', 'EXCLUDE_DB'), ('include_databases', 'INCLUDE_DB')):
         v = entry.get(key) or []
         if isinstance(v, str):
             v = [v]
@@ -409,7 +413,8 @@ CFG_DOCKER="auto"
 CFG_DOCKER_NETWORK="host"
 CFG_TIMEOUT=7200
 CFG_TIMESTAMP_FORMAT="%Y%m%d-%H%M%S"
-CFG_VERIFY="full"                 # full | header | none
+CFG_MAINTENANCE_DB="postgres"     # database used to enumerate / create / drop
+CFG_VERIFY="full"                 # full | header | none"
 CFG_INCLUDE_GLOBALS=true          # dump cluster roles/grants alongside 'backup all'
 CFG_LOCK=true                     # refuse to run while another dbtool holds the lock
 
@@ -518,16 +523,24 @@ acquire_lock() {
 use_ctx() {
     local p="$1" k
     for k in ENGINE HOST PORT USER PASS DB SSLMODE CHARSET LABEL FORMAT JOBS \
-             SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE; do
+             SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE ALL_DATABASES; do
         eval "CTX_$k=\"\$(gv ${p}${k})\""
     done
-    for k in EXCLUDE INCLUDE EXCLUDE_SCHEMA SCHEMA DUMP_ARGS RESTORE_ARGS; do
+    for k in EXCLUDE INCLUDE EXCLUDE_SCHEMA SCHEMA DUMP_ARGS RESTORE_ARGS EXCLUDE_DB INCLUDE_DB; do
         eval "CTX_$k=(\${${p}${k}[@]+\"\${${p}${k}[@]}\"})"
     done
     [[ -n $CTX_FORMAT ]] || CTX_FORMAT="$CFG_FORMAT"
     [[ -n $CTX_JOBS   ]] || CTX_JOBS="$CFG_JOBS"
     [[ -n $CTX_ENGINE ]] || die "entry '$CTX_LABEL': engine could not be determined"
-    [[ -n $CTX_DB     ]] || die "entry '$CTX_LABEL': database name is empty"
+    # A whole-server entry needs no database of its own: it connects to the
+    # maintenance database to enumerate the rest.
+    if [[ -z $CTX_DB ]]; then
+        if [[ ${CTX_ALL_DATABASES:-false} == true ]]; then
+            [[ $CTX_ENGINE == postgres ]] && CTX_DB="${CFG_MAINTENANCE_DB:-postgres}" || CTX_DB=""
+        else
+            die "entry '$CTX_LABEL': database name is empty"
+        fi
+    fi
     [[ $CTX_ENGINE == postgres || $CTX_ENGINE == mysql ]] || die "unsupported engine: $CTX_ENGINE"
 }
 
@@ -551,7 +564,12 @@ MY_MODE=""; MY_IMAGE=""; MY_SERVER_VER=""; MY_SERVER_MAJOR=""; MY_FLAVOR="mysql"
 
 _docker_ok() { have docker && docker info >/dev/null 2>&1; }
 
-_pg_query() {  # _pg_query <dbname> <sql>  -> value on stdout, via any available client
+# _pg_query collapses whitespace, which is right for a single value and wrong
+# for a list; _pg_rows keeps one row per line.
+_pg_rows() { _pg_query_raw "$@"; }
+_pg_query() { _pg_query_raw "$@" | tr -d '[:space:]'; }
+
+_pg_query_raw() {  # _pg_query_raw <dbname> <sql>  -> rows on stdout, via any available client
     local db="$1" sql="$2" out="" errf="$RUNDIR/pg.err"
     : >"$errf" 2>/dev/null || true; : >"$PG_ERR_FILE" 2>/dev/null || true
     if have psql; then
@@ -570,10 +588,13 @@ _pg_query() {  # _pg_query <dbname> <sql>  -> value on stdout, via any available
             >"$PG_ERR_FILE" 2>/dev/null || true
     fi
     rm -f "$errf"
-    printf '%s' "$(printf '%s' "$out" | tr -d '[:space:]')"
+    printf '%s\n' "$out"
 }
 
-_my_query() {  # _my_query <sql>
+_my_rows() { _my_query_raw "$@"; }
+_my_query() { _my_query_raw "$@" | tr -d '[:space:]'; }
+
+_my_query_raw() {  # _my_query_raw <sql>
     write_my_cnf
     local out="" errf="$RUNDIR/my.err"
     : >"$errf" 2>/dev/null || true; : >"$MY_ERR_FILE" 2>/dev/null || true
@@ -590,7 +611,7 @@ _my_query() {  # _my_query <sql>
             >"$MY_ERR_FILE" 2>/dev/null || true
     fi
     rm -f "$errf"
-    printf '%s' "$(printf '%s' "$out" | tr -d '[:space:]')"
+    printf '%s\n' "$out"
 }
 
 _native_major() {  # _native_major <binary>  -> major version of local client
@@ -825,6 +846,48 @@ build_my_dump_args() {  # populates DUMPARGS
     DUMPARGS+=(${CTX_INCLUDE[@]+"${CTX_INCLUDE[@]}"})
 }
 
+# ===========================================================================
+#  Server enumeration — "back up every database behind this URL"
+# ===========================================================================
+PG_LIST_SQL="SELECT datname FROM pg_database
+             WHERE datallowconn AND NOT datistemplate
+               AND has_database_privilege(current_user, datname, 'CONNECT')
+             ORDER BY datname"
+
+list_ctx_databases() {  # every database this CTX_* server will let us read
+    if [[ $CTX_ENGINE == postgres ]]; then
+        _pg_rows "$CTX_DB" "$PG_LIST_SQL" | sed '/^$/d'
+    else
+        _my_rows 'SHOW DATABASES' | sed '/^$/d' \
+            | grep -vxE 'information_schema|performance_schema|mysql|sys'
+    fi
+}
+
+db_included() {  # db_included <dbname>   (CTX_INCLUDE_DB / CTX_EXCLUDE_DB are globs)
+    local db="$1" p hit
+    if (( ${#CTX_INCLUDE_DB[@]} )); then
+        hit=false
+        for p in "${CTX_INCLUDE_DB[@]}"; do [[ $db == $p ]] && hit=true; done
+        $hit || return 1
+    fi
+    for p in ${CTX_EXCLUDE_DB[@]+"${CTX_EXCLUDE_DB[@]}"}; do [[ $db == $p ]] && return 1; done
+    return 0
+}
+
+# One line per database this entry expands to. A normal entry is itself; an
+# all_databases entry is whatever the server reports, minus the filters.
+entry_databases() {  # entry_databases <entry-name>
+    local name="$1"
+    load_entry databases "$name" EXP_
+    use_ctx EXP_
+    if [[ ${CTX_ALL_DATABASES:-false} != true ]]; then printf '%s\n' "$CTX_DB"; return 0; fi
+    local -a found=()
+    mapfile -t found < <(list_ctx_databases)
+    (( ${#found[@]} )) || { err "entry '$name': cannot list databases on ${CTX_HOST}:${CTX_PORT}: $(pg_err)"; return 1; }
+    local db
+    for db in "${found[@]}"; do db_included "$db" && printf '%s\n' "$db"; done
+}
+
 # Dumps are named <entry>_<engine>_<db>_<timestamp>.<ext>. Globbing "<entry>_*"
 # also matches a longer sibling entry (app_db vs app_db_archive), which made
 # --latest restore the wrong database and let prune delete the only copy of one.
@@ -912,14 +975,21 @@ verify_dump_artifact() {  # verify_dump_artifact <file>
 }
 
 backup_one() {
-    local name="$1"
+    local name="$1" db_override="${2:-}"
     load_entry databases "$name" SRC_
     use_ctx SRC_
+    # an all_databases entry produces one dump per database, labelled <entry>_<db>
+    local label="$name"
+    if [[ -n $db_override ]]; then
+        CTX_DB="$db_override"
+        [[ ${CTX_ALL_DATABASES:-false} == true ]] && label="${name}_${db_override}"
+    fi
+    CTX_LABEL="$label"
     resolve_client
 
     local ts base tmp final start elapsed size
     ts="$(date +"$CFG_TIMESTAMP_FORMAT")"
-    base="${CFG_BACKUP_DIR}/${name}_${CTX_ENGINE}_${CTX_DB}_${ts}"
+    base="${CFG_BACKUP_DIR}/${label}_${CTX_ENGINE}_${CTX_DB}_${ts}"
     start=$SECONDS
 
     if [[ $CTX_ENGINE == postgres ]]; then
@@ -927,42 +997,42 @@ backup_one() {
         case "$CTX_FORMAT" in
             custom)
                 final="${base}.dump"; tmp="$(dump_target "$final")"
-                log "dumping $name (pg custom, level $CFG_PG_COMPRESS_LEVEL) -> $(basename "$final")"
+                log "dumping $label (pg custom, level $CFG_PG_COMPRESS_LEVEL) -> $(basename "$final")"
                 pg_run pg_dump "${DUMPARGS[@]}" -Fc -Z "$CFG_PG_COMPRESS_LEVEL" >"$tmp" \
-                    || { rm -f "$tmp"; die "pg_dump failed for $name"; }
+                    || { rm -f "$tmp"; die "pg_dump failed for $label"; }
                 ;;
             plain)
                 final="${base}.sql$(comp_ext)"; tmp="$(dump_target "$final")"
-                log "dumping $name (pg plain, $CFG_COMPRESSION) -> $(basename "$final")"
+                log "dumping $label (pg plain, $CFG_COMPRESSION) -> $(basename "$final")"
                 pg_run pg_dump "${DUMPARGS[@]}" -Fp | compress_stream >"$tmp" \
-                    || { rm -f "$tmp"; die "pg_dump failed for $name"; }
+                    || { rm -f "$tmp"; die "pg_dump failed for $label"; }
                 ;;
             directory)
                 local STAGEDIR="${CFG_BACKUP_DIR}/.staging"
                 $DRY_RUN || mkdir -p "$STAGEDIR" || die "cannot create staging dir $STAGEDIR"
-                local dumpdir="${STAGEDIR}/${name}_${ts}.dir"
+                local dumpdir="${STAGEDIR}/${label}_${ts}.dir"
                 $DRY_RUN || CLEAN_PATHS+=("$dumpdir")
                 final="${base}.dir.tar$(comp_ext)"; tmp="$(dump_target "$final")"
-                log "dumping $name (pg directory, -j $CTX_JOBS) -> $(basename "$final")"
+                log "dumping $label (pg directory, -j $CTX_JOBS) -> $(basename "$final")"
                 DOCKER_EXTRA=(-v "$STAGEDIR":"$STAGEDIR" --user "$(id -u):$(id -g)")
                 pg_run pg_dump "${DUMPARGS[@]}" -Fd -j "$CTX_JOBS" -f "$dumpdir" \
-                    || { DOCKER_EXTRA=(); rm -f "$tmp"; die "pg_dump failed for $name"; }
+                    || { DOCKER_EXTRA=(); rm -f "$tmp"; die "pg_dump failed for $label"; }
                 DOCKER_EXTRA=()
                 $DRY_RUN || tar -C "$STAGEDIR" -cf - "$(basename "$dumpdir")" | compress_stream >"$tmp" \
-                    || { rm -f "$tmp"; die "packing the directory dump failed for $name"; }
+                    || { rm -f "$tmp"; die "packing the directory dump failed for $label"; }
                 ;;
             *) die "unknown postgres format '$CTX_FORMAT' (custom|plain|directory)" ;;
         esac
     else
         build_my_dump_args
         final="${base}.sql$(comp_ext)"; tmp="$(dump_target "$final")"
-        log "dumping $name (mysqldump, $CFG_COMPRESSION) -> $(basename "$final")"
+        log "dumping $label (mysqldump, $CFG_COMPRESSION) -> $(basename "$final")"
         my_run mysqldump "${DUMPARGS[@]}" | compress_stream >"$tmp" \
-            || { rm -f "$tmp"; die "mysqldump failed for $name"; }
+            || { rm -f "$tmp"; die "mysqldump failed for $label"; }
     fi
 
-    $DRY_RUN && { ok "dry-run: $name"; return 0; }
-    [[ -s $tmp ]] || { rm -f "$tmp"; die "dump produced an empty file for $name"; }
+    $DRY_RUN && { ok "dry-run: $label"; return 0; }
+    [[ -s $tmp ]] || { rm -f "$tmp"; die "dump produced an empty file for $label"; }
     mv "$tmp" "$final"
     chmod 640 "$final"
 
@@ -971,7 +1041,7 @@ backup_one() {
     write_meta "$final" "$CTX_ENGINE" "${PG_SERVER_VER:-$MY_SERVER_VER}" "$CTX_FORMAT"
     elapsed=$((SECONDS - start))
     size="$(stat -c %s "$final" 2>/dev/null || stat -f %z "$final")"
-    ok "$name -> $(basename "$final")  $(human "$size")  in ${elapsed}s"
+    ok "$label -> $(basename "$final")  $(human "$size")  in ${elapsed}s"
     upload_file "$final"
     upload_file "${final}.sha256"
     upload_file "${final}.meta.json"
@@ -987,13 +1057,21 @@ cmd_backup() {
     [[ ${#names[@]} -gt 0 ]] || die "no databases configured"
     sweep_stale_parts
 
-    local n failed=0 okc=0 rc=0 t0=$SECONDS
+    local n db failed=0 okc=0 rc=0 t0=$SECONDS
     for n in "${names[@]}"; do
         [[ -z $n ]] && continue
-        # `set -e` inside the subshell: running it as a plain conditional would
-        # suppress errexit there and let a failed dump fall through as success.
-        rc=0; ( set -e; backup_one "$n" ) || rc=$?
-        if (( rc == 0 )); then okc=$((okc+1)); else failed=$((failed+1)); err "backup failed: $n"; fi
+        local -a dbs=()
+        mapfile -t dbs < <(entry_databases "$n")
+        if (( ${#dbs[@]} == 0 )); then
+            failed=$((failed+1)); err "backup failed: $n (no database to dump)"; continue
+        fi
+        (( ${#dbs[@]} > 1 )) && log "entry '$n' covers ${#dbs[@]} databases: ${dbs[*]}"
+        for db in "${dbs[@]}"; do
+            # `set -e` inside the subshell: running it as a plain conditional would
+            # suppress errexit there and let a failed dump fall through as success.
+            rc=0; ( set -e; backup_one "$n" "$db" ) || rc=$?
+            if (( rc == 0 )); then okc=$((okc+1)); else failed=$((failed+1)); err "backup failed: $n/$db"; fi
+        done
     done
     if [[ $target == all && ${CFG_INCLUDE_GLOBALS:-true} == true ]]; then
         rc=0; ( set -e; cmd_globals ) || rc=$?
@@ -1035,7 +1113,7 @@ dump_globals() {  # expects a CTX_* pointing at one postgres server
     verify_dump_artifact "$final" || { rm -f "$final"; die "integrity check failed — discarded $(basename "$final")"; }
     decompress_stream "$final" | grep -q 'CREATE ROLE' || warn "no CREATE ROLE statements in $(basename "$final")"
 
-    CTX_LABEL="globals@${CTX_HOST}:${CTX_PORT}"
+    CTX_LABEL="globals_${host_tag}"      # must match the filename prefix for prune
     write_meta "$final" postgres "$PG_SERVER_VER" globals
     size="$(stat -c %s "$final" 2>/dev/null || stat -f %z "$final")"
     ok "globals ${CTX_HOST}:${CTX_PORT} -> $(basename "$final")  $(human "$size")"
@@ -1065,13 +1143,20 @@ cmd_globals() {
 prune_backups() {
     local days="${CFG_RETENTION_DAYS:-0}" keep="${CFG_RETENTION_MIN_KEEP:-0}"
     (( days > 0 )) || return 0
-    local -a names=(); mapfile -t names < <(cfgpy names "$CONFIG" databases)
-    # globals dumps belong to a server, not to a database entry, but they follow
-    # the same naming scheme so the same retention applies.
-    local -a gnames=()
-    mapfile -t gnames < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f -name 'globals_*_postgres_globals_*' \
-                          -printf '%f\n' 2>/dev/null | sed 's/_postgres_globals_.*$//' | sort -u)
-    names+=(${gnames[@]+"${gnames[@]}"})
+    # A whole-server entry never names a file itself: its dumps carry
+    # <entry>_<db>, and the bare name would glob across all of them.
+    local -a names=() cn=()
+    mapfile -t cn < <(cfgpy names "$CONFIG" databases)
+    local c
+    for c in ${cn[@]+"${cn[@]}"}; do entry_is_all_databases "$c" || names+=("$c"); done
+    # A config name is not the whole story: all_databases entries expand to
+    # <entry>_<db>, and globals belong to a server. Every artifact records the
+    # label its filename starts with, so take the groups from the sidecars.
+    local -a lnames=()
+    mapfile -t lnames < <(grep -ho '"label": *"[^"]*"' "$CFG_BACKUP_DIR"/*.meta.json 2>/dev/null \
+                          | sed -E 's/.*"label": *"([^"]*)".*/\1/' | sort -u)
+    names+=(${lnames[@]+"${lnames[@]}"})
+    mapfile -t names < <(printf '%s\n' ${names[@]+"${names[@]}"} | sed '/^$/d' | sort -u)
     local n f removed=0
     for n in ${names[@]+"${names[@]}"}; do
         [[ -z $n ]] && continue
@@ -1095,7 +1180,23 @@ prune_backups() {
 # ===========================================================================
 #  RESTORE
 # ===========================================================================
-latest_backup_for() { backups_for "$1" | head -1; }
+entry_is_all_databases() {  # entry_is_all_databases <entry-name>
+    local v
+    v="$(cfgpy entry "$CONFIG" databases "$1" ISALL_ 2>/dev/null | sed -n "s/^ISALL_ALL_DATABASES=//p" | tr -d "'")"
+    [[ $v == true ]]
+}
+
+latest_backup_for() {
+    # A whole-server entry owns no dumps of its own — its dumps are labelled
+    # <entry>_<db>, and "<entry>_*" would match several databases at once.
+    if entry_is_all_databases "$1"; then
+        local -a have=()
+        mapfile -t have < <(grep -ho '"label": *"[^"]*"' "$CFG_BACKUP_DIR"/*.meta.json 2>/dev/null \
+                            | sed -E 's/.*"label": *"([^"]*)".*/\1/' | grep "^$1_" | sort -u)
+        die "'$1' covers a whole server; restore one database by name${have:+ (${have[*]})}"
+    fi
+    backups_for "$1" | head -1
+}
 
 pg_db_exists() { [[ "$(_pg_query postgres "SELECT 1 FROM pg_database WHERE datname='${CTX_DB}'")" == 1 ]]; }
 
@@ -1384,18 +1485,128 @@ cmd_verify() {
     esac
 }
 
+# ===========================================================================
+#  TEST / PREFLIGHT
+# ===========================================================================
+pg_server_major() { local v="${1%%(*}"; v="${v%%.*}"; printf '%s' "$v"; }
+
+# Can this host actually produce a dump of that server, and how?
+check_pg_client() {  # check_pg_client <server-version>
+    local maj nat=""
+    maj="$(pg_server_major "$1")"
+    have pg_dump && nat="$(_native_major pg_dump || true)"
+    case "$CFG_DOCKER" in
+        never)
+            if [[ -n $nat && $nat -ge $maj ]]; then log "    client: native pg_dump $nat (docker: never) — OK"
+            else err "    client: pg_dump ${nat:-missing} cannot dump a server $maj and docker is disabled"; return 1; fi ;;
+        always)
+            _docker_ok && { log "    client: container postgres:$maj (docker: always) — OK"; return 0; }
+            err "    client: docker: always but docker is unavailable"; return 1 ;;
+        *)
+            if [[ -n $nat && $nat -ge $maj ]]; then log "    client: native pg_dump $nat >= server $maj — OK"
+            elif _docker_ok; then log "    client: native pg_dump ${nat:-none} < server $maj — will use container postgres:$maj"
+            else err "    client: pg_dump ${nat:-missing} cannot dump a server $maj and docker is unavailable"; return 1; fi ;;
+    esac
+}
+
+check_my_client() {
+    local nat=""
+    have mysqldump && nat="$(_native_major mysqldump || true)"
+    if [[ -n $nat && $nat == "${MY_SERVER_MAJOR:-$nat}" ]]; then log "    client: native mysqldump $nat — OK"
+    elif _docker_ok; then log "    client: native mysqldump ${nat:-none} — will use a version-matched container"
+    else err "    client: mysqldump ${nat:-missing} and no usable docker"; return 1; fi
+}
+
+# The real proof that a dump will work: ask the server for one.
+check_dumpable() {  # check_dumpable <db>...
+    local db rc=0 errf="$RUNDIR/dumpable.err"
+    resolve_client >/dev/null 2>&1 || { err "    cannot resolve a client for ${CTX_HOST}:${CTX_PORT}"; return 1; }
+    for db in "$@"; do
+        if pg_run pg_dump -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" \
+               --no-password --schema-only >/dev/null 2>"$errf"; then
+            ok "    dumpable: $db"
+        else
+            err "    NOT dumpable: $db — $(sed -e 's/^pg_dump: *//' -e '/^$/d' "$errf" | tail -1)"; rc=1
+        fi
+    done
+    rm -f "$errf"; return $rc
+}
+
+check_my_dumpable() {
+    local db rc=0 errf="$RUNDIR/dumpable.err"
+    resolve_client >/dev/null 2>&1 || { err "    cannot resolve a client for ${CTX_HOST}:${CTX_PORT}"; return 1; }
+    for db in "$@"; do
+        if my_run mysqldump --no-data --skip-lock-tables "$db" >/dev/null 2>"$errf"; then ok "    dumpable: $db"
+        else err "    NOT dumpable: $db — $(grep -v 'Using a password' "$errf" | tail -1)"; rc=1; fi
+    done
+    rm -f "$errf"; return $rc
+}
+
+test_entry() {  # test_entry <name> <deep>   (CTX_* already loaded)
+    local n="$1" deep="$2" rc=0
+    if [[ $CTX_ENGINE == postgres ]]; then
+        local v; v="$(_pg_query "$CTX_DB" 'SHOW server_version')"
+        [[ -n $v ]] || { err "$n: connection FAILED — $(pg_err)"; return 1; }
+        ok "$n: postgres $v at $CTX_HOST:$CTX_PORT/$CTX_DB"
+
+        # the maintenance database gates enumeration, --create and --drop
+        local maint="${CFG_MAINTENANCE_DB:-postgres}" m
+        m="$(_pg_query "$maint" 'SELECT 1')"
+        if [[ $m == 1 ]]; then log "    maintenance db '$maint': reachable (all_databases, --create, --drop)"
+        else warn "    maintenance db '$maint': NOT reachable — all_databases/--create/--drop unavailable: $(pg_err)"; fi
+
+        local su cdb
+        su="$(_pg_query "$CTX_DB" "SELECT rolsuper FROM pg_roles WHERE rolname=current_user")"
+        cdb="$(_pg_query "$CTX_DB" "SELECT rolcreatedb FROM pg_roles WHERE rolname=current_user")"
+        if [[ $su == t ]]; then log "    role '$CTX_USER': superuser — globals include role passwords"
+        else log "    role '$CTX_USER': not superuser (createdb=${cdb:-?}) — globals omit role passwords"; fi
+
+        local -a dbs=()
+        mapfile -t dbs < <(list_ctx_databases)
+        if (( ${#dbs[@]} )); then log "    databases readable by this role (${#dbs[@]}): ${dbs[*]}"
+        else warn "    cannot enumerate databases on this server"; fi
+
+        check_pg_client "$v" || rc=1
+        if [[ $deep == true ]] && (( ${#dbs[@]} )); then
+            local -a want=()
+            if [[ ${CTX_ALL_DATABASES:-false} == true ]]; then
+                local d; for d in "${dbs[@]}"; do db_included "$d" && want+=("$d"); done
+            else want=("$CTX_DB"); fi
+            check_dumpable ${want[@]+"${want[@]}"} || rc=1
+        fi
+    else
+        local v; v="$(_my_query 'SELECT VERSION()')"
+        [[ -n $v ]] || { err "$n: connection FAILED — $(my_err)"; return 1; }
+        ok "$n: mysql $v at $CTX_HOST:$CTX_PORT/${CTX_DB:-<server>}"
+        MY_SERVER_MAJOR="${v%%.*}"
+        local -a dbs=()
+        mapfile -t dbs < <(list_ctx_databases)
+        (( ${#dbs[@]} )) && log "    databases readable by this user (${#dbs[@]}): ${dbs[*]}" \
+                         || warn "    cannot enumerate databases on this server"
+        check_my_client || rc=1
+        if [[ $deep == true ]] && (( ${#dbs[@]} )); then
+            local -a want=()
+            if [[ ${CTX_ALL_DATABASES:-false} == true ]]; then
+                local d; for d in "${dbs[@]}"; do db_included "$d" && want+=("$d"); done
+            else want=("$CTX_DB"); fi
+            check_my_dumpable ${want[@]+"${want[@]}"} || rc=1
+        fi
+    fi
+    return $rc
+}
+
 cmd_test() {
-    local n rc=0
+    local deep=false n rc=0
+    while (( $# )); do
+        case "$1" in
+            --deep) deep=true; shift ;;
+            *) die "test: unknown option $1 (only --deep)" ;;
+        esac
+    done
     while read -r n; do
         [[ -z $n ]] && continue
         load_entry databases "$n" SRC_; use_ctx SRC_
-        if [[ $CTX_ENGINE == postgres ]]; then
-            local v; v="$(_pg_query "$CTX_DB" 'SHOW server_version')"
-            [[ -n $v ]] && ok "$n: postgres $v at $CTX_HOST:$CTX_PORT/$CTX_DB" || { err "$n: connection FAILED — $(pg_err)"; rc=1; }
-        else
-            local v; v="$(_my_query 'SELECT VERSION()')"
-            [[ -n $v ]] && ok "$n: mysql $v at $CTX_HOST:$CTX_PORT/$CTX_DB" || { err "$n: connection FAILED — $(my_err)"; rc=1; }
-        fi
+        test_entry "$n" "$deep" || rc=1
     done < <(cfgpy names "$CONFIG" databases)
     while read -r n; do
         [[ -z $n ]] && continue
@@ -1411,14 +1622,127 @@ cmd_test() {
     return $rc
 }
 
-cmd_parse_url() {
-    printf '%s\n' "$DBTOOL_CFG_PY" >"$PY"
-    cfgpy url "$1" "${2:-DB_}"
+# ===========================================================================
+#  DISCOVER — what is on this server that the config does not mention?
+# ===========================================================================
+discover_ctx() {  # CTX_* loaded; <entry-label-for-yaml>
+    local label="$1" v
+    if [[ $CTX_ENGINE == postgres ]]; then
+        v="$(_pg_query "$CTX_DB" 'SHOW server_version')"
+        [[ -n $v ]] || { err "cannot reach ${CTX_HOST}:${CTX_PORT}: $(pg_err)"; return 1; }
+    else
+        v="$(_my_query 'SELECT VERSION()')"
+        [[ -n $v ]] || { err "cannot reach ${CTX_HOST}:${CTX_PORT}: $(my_err)"; return 1; }
+    fi
+    printf '\n%s%s:%s%s  %s %s  as %s\n' "$C_B" "$CTX_HOST" "$CTX_PORT" "$C_0" "$CTX_ENGINE" "$v" "$CTX_USER"
+    printf '  %-32s %10s  %s\n' DATABASE SIZE 'IN CONFIG'
+    local -a rows=()
+    if [[ $CTX_ENGINE == postgres ]]; then
+        mapfile -t rows < <(_pg_rows "$CTX_DB" \
+            "SELECT datname || '|' || pg_size_pretty(pg_database_size(datname))
+               FROM pg_database
+              WHERE datallowconn AND NOT datistemplate
+                AND has_database_privilege(current_user, datname, 'CONNECT')
+              ORDER BY datname" | sed '/^$/d')
+    else
+        mapfile -t rows < <(_my_rows \
+            "SELECT table_schema || '|' || ROUND(SUM(data_length+index_length)/1024/1024,1) || ' MB'
+               FROM information_schema.tables
+              WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys')
+              GROUP BY table_schema ORDER BY table_schema" | sed '/^$/d')
+    fi
+    local r db size covered uncovered=0
+    local -a missing=()
+    for r in ${rows[@]+"${rows[@]}"}; do
+        db="${r%%|*}"; size="${r#*|}"
+        covered="$(covered_by_config "$CTX_HOST" "$CTX_PORT" "$db")"
+        [[ -n $covered ]] || { covered="-- NOT BACKED UP"; uncovered=$((uncovered+1)); missing+=("$db"); }
+        printf '  %-32s %10s  %s\n' "$db" "$size" "$covered"
+    done
+    (( ${#rows[@]} )) || warn "  no databases readable by '$CTX_USER' here"
+    if (( uncovered > 0 )); then
+        printf '\n  %s%d database(s) not covered by %s%s — add one entry for the whole server:%s\n' \
+               "$C_Y" "$uncovered" "$(basename "$CONFIG")" "$C_0" "$C_0"
+        cat <<YAML
+
+  - name: ${label}
+    engine: ${CTX_ENGINE}
+    host: ${CTX_HOST}
+    port: ${CTX_PORT}
+    user: ${CTX_USER}
+    password_env: YOUR_PASSWORD_VAR
+    all_databases: true            # enumerate at run time; new databases are picked up
+    # exclude_databases: ["template*", "postgres"]
+
+YAML
+    else
+        ok "  every database here is covered by the config"
+    fi
 }
 
-# ===========================================================================
-#  Usage
-# ===========================================================================
+covered_by_config() {  # covered_by_config <host> <port> <db>  -> entry name, or empty
+    local host="$1" port="$2" db="$3" n
+    while read -r n; do
+        [[ -z $n ]] && continue
+        load_entry databases "$n" CHK_
+        [[ "$(gv CHK_HOST)" == "$host" && "$(gv CHK_PORT)" == "$port" ]] || continue
+        if [[ "$(gv CHK_ALL_DATABASES)" == true ]]; then
+            # an all_databases entry still honours its include/exclude filters
+            local pat inc_hit=true
+            eval "local -a inc=(\${CHK_INCLUDE_DB[@]+\"\${CHK_INCLUDE_DB[@]}\"})"
+            eval "local -a exc=(\${CHK_EXCLUDE_DB[@]+\"\${CHK_EXCLUDE_DB[@]}\"})"
+            if (( ${#inc[@]} )); then
+                inc_hit=false
+                for pat in "${inc[@]}"; do [[ $db == $pat ]] && inc_hit=true; done
+            fi
+            if $inc_hit; then
+                local excluded=false
+                for pat in ${exc[@]+"${exc[@]}"}; do [[ $db == $pat ]] && excluded=true; done
+                $excluded || { printf '%s (all_databases)' "$n"; return 0; }
+            fi
+            continue
+        fi
+        [[ "$(gv CHK_DB)" == "$db" ]] && { printf '%s' "$n"; return 0; }
+    done < <(cfgpy names "$CONFIG" databases)
+    printf ''
+}
+
+cmd_discover() {
+    local url="" target="all" rc=0
+    while (( $# )); do
+        case "$1" in
+            --url) url="$2"; shift 2 ;;
+            -*) die "discover: unknown option $1" ;;
+            *) target="$1"; shift ;;
+        esac
+    done
+    if [[ -n $url ]]; then
+        eval "$(cfgpy url "$url" DSN_)"
+        CTX_ENGINE="$(gv DSN_ENGINE)"; CTX_HOST="$(gv DSN_HOST)"; CTX_PORT="$(gv DSN_PORT)"
+        CTX_USER="$(gv DSN_USER)"; CTX_PASS="$(gv DSN_PASS)"; CTX_SSLMODE="$(gv DSN_SSLMODE)"
+        CTX_CHARSET=""; CTX_DB="$(gv DSN_DB)"; CTX_ALL_DATABASES=true
+        CTX_INCLUDE_DB=(); CTX_EXCLUDE_DB=()
+        [[ -n $CTX_DB ]] || CTX_DB="${CFG_MAINTENANCE_DB:-postgres}"
+        discover_ctx "server_${CTX_HOST//./_}" || rc=1
+        return $rc
+    fi
+    local -a names=()
+    if [[ $target == all ]]; then mapfile -t names < <(cfgpy names "$CONFIG" databases)
+    else IFS=',' read -r -a names <<<"$target"; fi
+    local n seen_key
+    local -A seen=()
+    for n in ${names[@]+"${names[@]}"}; do
+        [[ -z $n ]] && continue
+        load_entry databases "$n" DSC_; use_ctx DSC_
+        seen_key="${CTX_HOST}:${CTX_PORT}"
+        [[ -n ${seen[$seen_key]:-} ]] && continue
+        seen[$seen_key]=1
+        discover_ctx "server_${CTX_HOST//./_}" || rc=1
+    done
+    (( ${#seen[@]} )) || warn "no sources configured — try: $SCRIPT_NAME discover --url 'postgresql://user:pass@host:5432/postgres'"
+    return $rc
+}
+
 usage() {
 cat <<EOF
 ${SCRIPT_NAME} v${DBTOOL_VERSION} — PostgreSQL / MySQL backup, restore, migrate
@@ -1433,10 +1757,14 @@ COMMANDS
   migrate --from SRC --to TGT    Stream a database to another server
           [--target-db DB] [--create] [--drop] [--via-file]
   globals                        Dump cluster roles/grants for every postgres server
+  discover [name|all]            List every database on the configured servers and
+           [--url DSN]           show which ones the config does not cover
   list                           Show configured sources, targets and local backups
   prune                          Apply the retention policy now
   verify FILE                    Check checksum + full archive/dump integrity
-  test                           Connectivity + version check for every entry
+  test [--deep]                  Connectivity, maintenance-db access, privileges,
+                                 client/server compatibility; --deep proves every
+                                 database really dumps (schema-only trial run)
   parse-url URL [PREFIX]         Print shell vars parsed from a DATABASE_URL
 
 GLOBAL OPTIONS
@@ -1450,6 +1778,8 @@ GLOBAL OPTIONS
 
 EXAMPLES
   ${SCRIPT_NAME} -c /etc/dbtool/dbtool.yml test
+  ${SCRIPT_NAME} test --deep
+  ${SCRIPT_NAME} discover --url 'postgresql://user:pass@10.0.0.5:5432/postgres'
   ${SCRIPT_NAME} backup all
   ${SCRIPT_NAME} backup app_dev,crm_mysql
   ${SCRIPT_NAME} restore --latest app_dev -t staging_pg --create -y
@@ -1491,7 +1821,8 @@ main() {
         list)    cmd_list ;;
         prune)   acquire_lock; prune_backups ;;
         verify)  cmd_verify ${rest[@]+"${rest[@]}"} ;;
-        test)    cmd_test ;;
+        test)    cmd_test ${rest[@]+"${rest[@]}"} ;;
+        discover) cmd_discover ${rest[@]+"${rest[@]}"} ;;
         *) die "unknown command: $cmd (see -h)" ;;
     esac
 }

@@ -14,6 +14,7 @@
     "docker_network": "host",
     "timeout": 7200,
     "timestamp_format": "%Y%m%d-%H%M%S",
+    "maintenance_db": "postgres",
     "verify": "full",
     "include_globals": true,
     "lock": true
@@ -32,6 +33,16 @@
   },
 
   "databases": [
+    {
+      "name": "pg_main",
+      "engine": "postgres",
+      "host": "db-primary.example.com",
+      "port": 5432,
+      "user": "postgres",
+      "password_env": "APP_PG_PASSWORD",
+      "all_databases": true,
+      "exclude_databases": ["postgres", "test_*"]
+    },
     {
       "name": "app_dev",
       "url": "postgresql+asyncpg://app_user:${APP_PG_PASSWORD}@${DB_HOST}:5432/app_dev"

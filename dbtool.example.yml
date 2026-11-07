@@ -23,6 +23,7 @@ defaults:
   docker_network: host
   timeout: 7200                     # seconds, per dump/restore
   timestamp_format: "%Y%m%d-%H%M%S"
+  maintenance_db: postgres          # database used to enumerate / create / drop
   verify: full                      # full | header | none — full reads the whole archive back
   include_globals: true             # 'backup all' also dumps cluster roles/grants per server
   lock: true                        # refuse to run while another dbtool holds the backup_dir
@@ -45,6 +46,17 @@ notify:
 #  Sources — what gets backed up
 # --------------------------------------------------------------------------
 databases:
+  # 0) A whole server: every database behind this URL is dumped, and one added
+  #    later is picked up on the next run. Each becomes <name>_<db>.
+  - name: pg_main
+    engine: postgres
+    host: db-primary.example.com
+    port: 5432
+    user: postgres
+    password_env: APP_PG_PASSWORD
+    all_databases: true
+    exclude_databases: ["postgres", "test_*"]   # globs; include_databases also works
+
   # 1) Simplest form: reuse an existing SQLAlchemy/dotenv URL as-is.
   - name: app_dev
     url: "postgresql+asyncpg://app_user:${APP_PG_PASSWORD}@${DB_HOST}:5432/app_dev"

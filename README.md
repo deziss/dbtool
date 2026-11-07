@@ -78,7 +78,7 @@ Aliases are accepted where obvious (`username`/`uname`, `pass`/`passwd`, `db`/`d
 `defaults` controls `backup_dir`, `log_file`, `retention_days`, `retention_min_keep`,
 `compression` (`zstd|gzip|none`), `pg_compress_level`, `format` (`custom|plain|directory`),
 `jobs`, `docker` (`auto|always|never`), `docker_network`, `timeout`, `timestamp_format`,
-`verify` (`full|header|none`), `include_globals` and `lock`.
+`verify` (`full|header|none`), `include_globals`, `lock` and `maintenance_db`.
 
 `databases:` are backup sources; `targets:` are restore/migration destinations. The JSON file
 is byte-for-byte the same structure — use whichever you prefer.
@@ -87,6 +87,8 @@ is byte-for-byte the same structure — use whichever you prefer.
 
 ```bash
 dbtool test                                   # connect + print server versions
+dbtool test --deep                            # + privileges, client match, trial dump of every db
+dbtool discover                               # what is on these servers that the config misses
 dbtool backup all                             # everything enabled, plus cluster globals
 dbtool backup app_dev,crm_mysql               # a subset
 dbtool globals                                # roles/grants only, one file per server
@@ -105,6 +107,66 @@ read back completely — `pg_restore -f /dev/null` for custom format, full decom
 writer's completion marker for plain SQL. Listing an archive header is not enough: a dump
 truncated by a timeout or a dropped connection still lists a complete table of contents. Set
 `verify: header` for the cheap check, or `verify: none` to skip it.
+
+## Back up every database on a server
+
+`backup all` dumps the entries in the config, so a database created later is
+silently not backed up. Give an entry `all_databases: true` and it stands for the
+whole server instead — dbtool asks the server what it has, every run:
+
+```yaml
+databases:
+  - name: pg_main
+    engine: postgres
+    host: db-primary.example.com
+    port: 5432
+    user: postgres
+    password_env: APP_PG_PASSWORD
+    all_databases: true
+    exclude_databases: ["postgres", "test_*"]   # globs; include_databases also works
+```
+
+Each database becomes its own dump labelled `<entry>_<db>`, so retention, restore and
+verification stay per-database:
+
+```
+pg_main_orders_postgres_orders_20261107-020000.dump
+pg_main_billing_postgres_billing_20261107-020000.dump
+dbtool restore --latest pg_main_orders -t staging_pg --create -y
+```
+
+Enumeration needs the maintenance database (`postgres` by default, `maintenance_db:`
+to change it) and reports only databases the role may `CONNECT` to — one role without
+rights to a database means that database is skipped, which is why `test --deep` exists.
+
+`dbtool discover` lists what each configured server holds, with sizes, marking anything
+the config does not cover and printing an entry to paste. It also works against a URL
+that is not in the config at all:
+
+```bash
+dbtool discover
+dbtool discover --url 'postgresql://user:pass@10.0.0.5:5432/postgres'
+```
+
+## Preflight
+
+`dbtool test` checks connectivity and versions. `dbtool test --deep` answers the
+question that matters before you trust a schedule — *will every database actually
+dump?*
+
+```
+OK s192: postgres 18.4 at 10.10.110.192:5432/postgres
+    maintenance db 'postgres': reachable (all_databases, --create, --drop)
+    role 'nuhire_user': superuser — globals include role passwords
+    databases readable by this role (5): nuhire_dev nuhire_local nuhire_prod postgres postgres_nuhire
+    client: native pg_dump 18 >= server 18 — OK
+OK     dumpable: nuhire_dev
+OK     dumpable: nuhire_local
+```
+
+Without `--deep` the first five lines still run; `--deep` adds a real `--schema-only`
+dump of each database through the same client the backup would use. It exits non-zero
+if any check fails, so it works as a cron guard or a post-deploy gate.
 
 ## Roles and grants
 

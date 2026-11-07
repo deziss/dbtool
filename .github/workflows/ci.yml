@@ -190,6 +190,76 @@ jobs:
           rm -f "$trunc" "$trunc.meta.json" "$trunc.sha256"
           echo "verify correctly rejected the truncated dump"
 
+      - name: all_databases expands to every database on the server
+        run: |
+          psql -h 127.0.0.1 -U postgres -c 'create database extra_db' || true
+          psql -h 127.0.0.1 -U postgres -c 'create database skipme_db' || true
+          mkdir -p "$RUNNER_TEMP/backups-srv"
+          cat > "$RUNNER_TEMP/dbtool-srv.yml" <<YML
+          defaults:
+            backup_dir: $RUNNER_TEMP/backups-srv
+            retention_days: 1
+            retention_min_keep: 1
+            docker: auto
+            include_globals: false
+          databases:
+            - name: srv
+              engine: postgres
+              host: 127.0.0.1
+              port: 5432
+              user: postgres
+              password: ci_password
+              database: postgres
+              all_databases: true
+              exclude_databases: ["skipme_db", "template*"]
+          YML
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool-srv.yml" backup all -y
+          ls "$RUNNER_TEMP/backups-srv"
+          for db in ci_db extra_db postgres; do
+            ls "$RUNNER_TEMP/backups-srv/srv_${db}_postgres_${db}_"*.dump >/dev/null \
+              || { echo "::error::$db was not dumped by all_databases"; exit 1; }
+          done
+          if ls "$RUNNER_TEMP/backups-srv"/srv_skipme_db_* 2>/dev/null; then
+            echo "::error::exclude_databases was ignored"; exit 1
+          fi
+          # the bare server entry must not act as a restore/prune group
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool-srv.yml" restore --latest srv -t srv -n -y; then
+            echo "::error::--latest on a whole-server entry should be refused"; exit 1
+          fi
+          picked=$(./dbtool.sh -c "$RUNNER_TEMP/dbtool-srv.yml" restore --latest srv_postgres \
+                     -t srv -n -y --database postgres | sed -n 's/.*latest: //p' | head -1)
+          case "$picked" in
+            srv_postgres_postgres_postgres_*) echo "correct dump for srv_postgres" ;;
+            *) echo "::error::--latest srv_postgres picked $picked"; exit 1 ;;
+          esac
+        env:
+          PGPASSWORD: ci_password
+
+      - name: discover and test --deep
+        env:
+          PGPASSWORD: ci_password
+        run: |
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool-srv.yml" discover | tee "$RUNNER_TEMP/disc.log"
+          grep -q 'extra_db' "$RUNNER_TEMP/disc.log" || { echo "::error::discover missed extra_db"; exit 1; }
+          grep -q 'NOT BACKED UP' "$RUNNER_TEMP/disc.log" \
+            || { echo "::error::discover did not flag the excluded database"; exit 1; }
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool-srv.yml" test --deep | tee "$RUNNER_TEMP/deep.log"
+          grep -q 'maintenance db' "$RUNNER_TEMP/deep.log"
+          grep -q 'dumpable: ci_db' "$RUNNER_TEMP/deep.log" \
+            || { echo "::error::--deep did not prove ci_db dumpable"; exit 1; }
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool-srv.yml" discover \
+            --url "postgresql://postgres:ci_password@127.0.0.1:5432/postgres" | grep -q 'ci_db'
+
+      - name: test --deep must fail when a database cannot be dumped
+        env:
+          PGPASSWORD: ci_password
+        run: |
+          sed 's#port: 5432#port: 5999#' "$RUNNER_TEMP/dbtool-srv.yml" > "$RUNNER_TEMP/dbtool-dead.yml"
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool-dead.yml" test --deep; then
+            echo "::error::test --deep passed against a dead server"; exit 1
+          fi
+          echo "preflight fails loudly when the server is unreachable"
+
       - name: regression - a failed probe must report why
         run: |
           cat > "$RUNNER_TEMP/dbtool-bad.yml" <<YML
