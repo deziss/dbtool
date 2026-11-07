@@ -20,6 +20,16 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck --severity=error --shell=bash dbtool.sh
 
+      - name: every command referenced is actually defined
+        run: |
+          # a refactor once deleted cmd_parse_url along with the region around it,
+          # and only the smoke test noticed
+          rc=0
+          for f in $(grep -oE '\bcmd_[a-z_]+' dbtool.sh | sort -u); do
+            grep -q "^$f()" dbtool.sh || { echo "::error::$f is called but never defined"; rc=1; }
+          done
+          exit $rc
+
       - name: example configs parse
         run: |
           python3 -c "import json; json.load(open('dbtool.example.json')); print('json ok')"
