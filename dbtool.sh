@@ -23,9 +23,13 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.1.0"
+readonly DBTOOL_VERSION="1.2.0"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
+# link to /opt/dbtool/dbtool.sh, and self-update has to replace the latter.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s/%s' "$SCRIPT_DIR" "$SCRIPT_NAME")"
+DBTOOL_UPDATE_URL="${DBTOOL_UPDATE_URL:-https://raw.githubusercontent.com/deziss/dbtool/main/dbtool.sh}"
 
 # ===========================================================================
 #  Embedded config parser (YAML + JSON, no hard dependency on PyYAML)
@@ -1743,6 +1747,60 @@ cmd_discover() {
     return $rc
 }
 
+# ===========================================================================
+#  SELF-UPDATE
+# ===========================================================================
+cmd_self_update() {
+    local check_only=false force=false
+    while (( $# )); do
+        case "$1" in
+            --check) check_only=true; shift ;;
+            --force) force=true; shift ;;
+            *) die "self-update: unknown option $1 (--check, --force)" ;;
+        esac
+    done
+    have curl || die "self-update needs curl (or update with: git pull && sudo ./install.sh)"
+    local tmp="$RUNDIR/dbtool.new"
+    log "fetching $DBTOOL_UPDATE_URL"
+    curl -fsSL --max-time 60 "$DBTOOL_UPDATE_URL" -o "$tmp" \
+        || die "cannot download $DBTOOL_UPDATE_URL"
+
+    # Never swap in something that is not a dbtool, and never one that does not
+    # parse: this file is what runs every night.
+    head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || die "downloaded file is not a shell script"
+    local newv
+    newv="$(sed -n 's/^readonly DBTOOL_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -1)"
+    [[ -n $newv ]] || die "downloaded file carries no DBTOOL_VERSION — refusing"
+    bash -n "$tmp" || die "downloaded file has a syntax error — refusing"
+
+    if ! $force; then
+        if [[ $newv == "$DBTOOL_VERSION" ]]; then
+            ok "already up to date (v$DBTOOL_VERSION)"
+            return 0
+        fi
+        # a remote that is behind this one is not an update — someone pointed
+        # DBTOOL_UPDATE_URL at an older branch, or a release was rolled back
+        local newest
+        newest="$(printf '%s\n%s\n' "$newv" "$DBTOOL_VERSION" | sort -V | tail -1)"
+        if [[ $newest == "$DBTOOL_VERSION" ]]; then
+            ok "installed v$DBTOOL_VERSION is newer than v$newv at $DBTOOL_UPDATE_URL — nothing to do (--force to install it anyway)"
+            return 0
+        fi
+    fi
+    log "installed v$DBTOOL_VERSION — available v$newv"
+    $check_only && { warn "update available: v$DBTOOL_VERSION -> v$newv (run: $SCRIPT_NAME self-update)"; return 10; }
+    $DRY_RUN && { ok "dry-run: would replace $SCRIPT_PATH with v$newv"; return 0; }
+
+    [[ -w $SCRIPT_PATH ]] || die "$SCRIPT_PATH is not writable — re-run with sudo"
+    local bak="${SCRIPT_PATH}.v${DBTOOL_VERSION}.bak"
+    cp -p "$SCRIPT_PATH" "$bak" || die "cannot keep a backup at $bak"
+    # rename, not overwrite: the shell is still reading the running file
+    cp "$tmp" "${SCRIPT_PATH}.new" && chmod 0755 "${SCRIPT_PATH}.new" \
+        && mv -f "${SCRIPT_PATH}.new" "$SCRIPT_PATH" \
+        || die "could not install the new version (old one untouched at $SCRIPT_PATH)"
+    ok "updated $SCRIPT_PATH: v$DBTOOL_VERSION -> v$newv  (previous kept at $(basename "$bak"))"
+}
+
 usage() {
 cat <<EOF
 ${SCRIPT_NAME} v${DBTOOL_VERSION} — PostgreSQL / MySQL backup, restore, migrate
@@ -1762,6 +1820,8 @@ COMMANDS
   list                           Show configured sources, targets and local backups
   prune                          Apply the retention policy now
   verify FILE                    Check checksum + full archive/dump integrity
+  self-update [--check]          Replace this script with the latest release
+                                 (--check only reports, exit 10 if one is due)
   test [--deep]                  Connectivity, maintenance-db access, privileges,
                                  client/server compatibility; --deep proves every
                                  database really dumps (schema-only trial run)
@@ -1812,6 +1872,11 @@ main() {
     [[ -n $cmd ]] || { usage; exit 1; }
 
     if [[ $cmd == parse-url ]]; then cmd_parse_url ${rest[@]+"${rest[@]}"}; exit $?; fi
+    # deliberately before load_config: a config problem must not stand between
+    # you and a fixed version of the tool
+    if [[ $cmd == self-update || $cmd == selfupdate || $cmd == update ]]; then
+        cmd_self_update ${rest[@]+"${rest[@]}"}; exit $?
+    fi
     load_config
     case "$cmd" in
         backup)  acquire_lock; cmd_backup ${rest[@]+"${rest[@]}"} ;;

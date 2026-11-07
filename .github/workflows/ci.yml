@@ -32,6 +32,37 @@ jobs:
           print("yaml ok")
           PY
 
+      - name: install.sh installs, updates and never clobbers a config
+        run: |
+          root="$RUNNER_TEMP/inst"; mkdir -p "$root/bin"
+          PREFIX="$root/opt" BIN="$root/bin/dbtool" CONF="$root/etc" ./install.sh
+          "$root/bin/dbtool" --version
+          [ -f "$root/etc/dbtool.yml" ] && [ -f "$root/etc/dbtool.env" ]
+          echo '# MY REAL CONFIG' > "$root/etc/dbtool.yml"
+          printf 'SECRET=keepme\n' > "$root/etc/dbtool.env"
+          PREFIX="$root/opt" BIN="$root/bin/dbtool" CONF="$root/etc" ./install.sh
+          grep -q 'MY REAL CONFIG' "$root/etc/dbtool.yml" || { echo "::error::install.sh overwrote dbtool.yml"; exit 1; }
+          grep -q 'SECRET=keepme' "$root/etc/dbtool.env" || { echo "::error::install.sh overwrote dbtool.env"; exit 1; }
+          echo "install and re-install both clean"
+
+      - name: self-update validates what it downloads
+        run: |
+          root="$RUNNER_TEMP/inst"
+          # a file that is not a dbtool must never be swapped in
+          printf 'not a script\n' > "$RUNNER_TEMP/junk.txt"
+          if DBTOOL_UPDATE_URL="file://$RUNNER_TEMP/junk.txt" "$root/bin/dbtool" self-update; then
+            echo "::error::self-update accepted a non-script"; exit 1
+          fi
+          # a dbtool with a syntax error must be refused too
+          printf '#!/usr/bin/env bash\nreadonly DBTOOL_VERSION="9.9.9"\nif [ ; then\n' > "$RUNNER_TEMP/broken.sh"
+          if DBTOOL_UPDATE_URL="file://$RUNNER_TEMP/broken.sh" "$root/bin/dbtool" self-update; then
+            echo "::error::self-update accepted a script that does not parse"; exit 1
+          fi
+          # the same version is a no-op
+          DBTOOL_UPDATE_URL="file://$PWD/dbtool.sh" "$root/bin/dbtool" self-update | grep -q 'already up to date'
+          [ -x "$root/opt/dbtool.sh" ]
+          echo "self-update refuses junk and keeps the installed script"
+
       - name: cli smoke test
         run: |
           ./dbtool.sh --version

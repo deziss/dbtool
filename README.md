@@ -17,6 +17,8 @@ dbtool/
 ├── systemd/
 │   ├── dbtool-backup.service
 │   └── dbtool-backup.timer
+├── install.sh                # install or update in one command
+├── CHANGELOG.md              # what changed between versions
 ├── .github/workflows/ci.yml  # shellcheck + a real backup/restore round-trip
 └── LICENSE                   # GNU AGPL v3
 ```
@@ -28,15 +30,37 @@ dbtool/
 ## Install
 
 ```bash
-sudo mkdir -p /opt/dbtool /etc/dbtool /backup/db
-sudo install -m 0755 dbtool.sh /opt/dbtool/dbtool.sh
-sudo install -m 0640 dbtool.example.yml /etc/dbtool/dbtool.yml
-sudo install -m 0600 dbtool.env.example /etc/dbtool/dbtool.env
-sudo ln -sf /opt/dbtool/dbtool.sh /usr/local/bin/dbtool
+git clone https://github.com/deziss/dbtool.git && cd dbtool
+sudo ./install.sh                 # add --systemd for the nightly timer
 
 # edit /etc/dbtool/dbtool.yml and /etc/dbtool/dbtool.env, then:
-dbtool -c /etc/dbtool/dbtool.yml test
+dbtool test --deep
 ```
+
+`install.sh` puts the script in `/opt/dbtool`, links `/usr/local/bin/dbtool`, and
+refreshes the examples in `/etc/dbtool`. Override with `PREFIX=`, `BIN=`, `CONF=`.
+
+## Updating
+
+Re-running the installer is the whole update, and it never touches your
+`dbtool.yml` or `dbtool.env`:
+
+```bash
+cd dbtool && git pull && sudo ./install.sh
+```
+
+Without a checkout on the box, replace the script in place:
+
+```bash
+sudo dbtool self-update            # downloads, parses and version-checks before swapping
+dbtool self-update --check         # report only; exit 10 when an update is due
+```
+
+`self-update` refuses anything that is not a dbtool or does not parse, keeps the
+previous version beside it as `dbtool.sh.v<old>.bak`, and installs by rename so the
+running process is never rewritten under itself. It will not install an older remote
+unless you pass `--force`. Point it elsewhere with `DBTOOL_UPDATE_URL=`. Version in
+`dbtool --version`, changes in [CHANGELOG.md](CHANGELOG.md).
 
 Requirements: `bash` 4+, `python3` (stdlib only — PyYAML is used if present, otherwise a
 built-in YAML subset parser handles the config), and either native `psql`/`pg_dump`/`mysql`/
