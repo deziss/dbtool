@@ -23,13 +23,17 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.2.0"
+readonly DBTOOL_VERSION="1.2.1"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
 # link to /opt/dbtool/dbtool.sh, and self-update has to replace the latter.
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s/%s' "$SCRIPT_DIR" "$SCRIPT_NAME")"
-DBTOOL_UPDATE_URL="${DBTOOL_UPDATE_URL:-https://raw.githubusercontent.com/deziss/dbtool/main/dbtool.sh}"
+DBTOOL_REPO="${DBTOOL_REPO:-deziss/dbtool}"
+# release (default, the newest tag) or main (the development branch).
+# DBTOOL_UPDATE_URL overrides both and is used verbatim.
+DBTOOL_UPDATE_CHANNEL="${DBTOOL_UPDATE_CHANNEL:-release}"
+DBTOOL_UPDATE_URL="${DBTOOL_UPDATE_URL:-}"
 
 # ===========================================================================
 #  Embedded config parser (YAML + JSON, no hard dependency on PyYAML)
@@ -1761,14 +1765,27 @@ cmd_self_update() {
         case "$1" in
             --check) check_only=true; shift ;;
             --force) force=true; shift ;;
-            *) die "self-update: unknown option $1 (--check, --force)" ;;
+            --main)  DBTOOL_UPDATE_CHANNEL=main; shift ;;
+            --release) DBTOOL_UPDATE_CHANNEL=release; shift ;;
+            *) die "self-update: unknown option $1 (--check, --force, --main, --release)" ;;
         esac
     done
     have curl || die "self-update needs curl (or update with: git pull && sudo ./install.sh)"
-    local tmp="$RUNDIR/dbtool.new"
-    log "fetching $DBTOOL_UPDATE_URL"
-    curl -fsSL --max-time 60 "$DBTOOL_UPDATE_URL" -o "$tmp" \
-        || die "cannot download $DBTOOL_UPDATE_URL"
+    local tmp="$RUNDIR/dbtool.new" url="$DBTOOL_UPDATE_URL" ref=""
+    if [[ -z $url ]]; then
+        if [[ $DBTOOL_UPDATE_CHANNEL == release ]]; then
+            # newest published release; fall back to the branch if the API is
+            # unreachable or nothing has been released yet
+            ref="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${DBTOOL_REPO}/releases/latest" 2>/dev/null \
+                   | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+            [[ -n $ref ]] || { warn "no published release found for ${DBTOOL_REPO} — falling back to main"; ref=main; }
+        else
+            ref=main
+        fi
+        url="https://raw.githubusercontent.com/${DBTOOL_REPO}/${ref}/dbtool.sh"
+    fi
+    log "fetching ${ref:+$ref — }$url"
+    curl -fsSL --max-time 60 "$url" -o "$tmp" || die "cannot download $url"
 
     # Never swap in something that is not a dbtool, and never one that does not
     # parse: this file is what runs every night.
@@ -1788,7 +1805,7 @@ cmd_self_update() {
         local newest
         newest="$(printf '%s\n%s\n' "$newv" "$DBTOOL_VERSION" | sort -V | tail -1)"
         if [[ $newest == "$DBTOOL_VERSION" ]]; then
-            ok "installed v$DBTOOL_VERSION is newer than v$newv at $DBTOOL_UPDATE_URL — nothing to do (--force to install it anyway)"
+            ok "installed v$DBTOOL_VERSION is newer than v$newv at $url — nothing to do (--force to install it anyway)"
             return 0
         fi
     fi
@@ -1825,8 +1842,9 @@ COMMANDS
   list                           Show configured sources, targets and local backups
   prune                          Apply the retention policy now
   verify FILE                    Check checksum + full archive/dump integrity
-  self-update [--check]          Replace this script with the latest release
-                                 (--check only reports, exit 10 if one is due)
+  self-update [--check]          Replace this script with the newest release
+              [--main|--force]   (--check only reports, exit 10 if one is due;
+                                 --main tracks the branch instead)
   test [--deep]                  Connectivity, maintenance-db access, privileges,
                                  client/server compatibility; --deep proves every
                                  database really dumps (schema-only trial run)

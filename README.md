@@ -56,11 +56,24 @@ sudo dbtool self-update            # downloads, parses and version-checks before
 dbtool self-update --check         # report only; exit 10 when an update is due
 ```
 
-`self-update` refuses anything that is not a dbtool or does not parse, keeps the
-previous version beside it as `dbtool.sh.v<old>.bak`, and installs by rename so the
-running process is never rewritten under itself. It will not install an older remote
-unless you pass `--force`. Point it elsewhere with `DBTOOL_UPDATE_URL=`. Version in
-`dbtool --version`, changes in [CHANGELOG.md](CHANGELOG.md).
+`self-update` follows the newest [published release](https://github.com/deziss/dbtool/releases).
+It refuses anything that is not a dbtool or does not parse, keeps the previous version
+beside it as `dbtool.sh.v<old>.bak`, and installs by rename so the running process is
+never rewritten under itself. It will not install an older remote unless you pass
+`--force`. `--main` follows the development branch instead; `DBTOOL_REPO=` points at a
+fork and `DBTOOL_UPDATE_URL=` overrides the lot. Version in `dbtool --version`, changes
+in [CHANGELOG.md](CHANGELOG.md).
+
+### Cutting a release
+
+Releases are published by pushing a tag — the workflow refuses one that disagrees with
+`DBTOOL_VERSION`, takes the notes from `CHANGELOG.md`, and attaches `dbtool.sh` and
+`install.sh`:
+
+```bash
+# bump readonly DBTOOL_VERSION in dbtool.sh, add a CHANGELOG section, commit
+git tag -a v1.3.0 -m "dbtool v1.3.0" && git push origin v1.3.0
+```
 
 Requirements: `bash` 4+, `python3` (stdlib only — PyYAML is used if present, otherwise a
 built-in YAML subset parser handles the config), and either native `psql`/`pg_dump`/`mysql`/

@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the tag must match the version in the script
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(sed -n 's/^readonly DBTOOL_VERSION="\([^"]*\)".*/\1/p' dbtool.sh | head -1)"
+          echo "tag $tag, script $ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag v$tag does not match DBTOOL_VERSION $ver"; exit 1; }
+
+      - name: sanity checks
+        run: |
+          bash -n dbtool.sh
+          bash -n install.sh
+          ./dbtool.sh --version
+          ./dbtool.sh --help > /dev/null
+
+      - name: release notes from the changelog
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # the section for this version, up to the next heading
+          awk -v v="$ver" '
+            $0 ~ "^## " v "$" {inside=1; next}
+            inside && /^## / {exit}
+            inside {print}
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || printf 'See [CHANGELOG.md](CHANGELOG.md).\n' > notes.md
+          cat notes.md
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --latest \
+            dbtool.sh install.sh

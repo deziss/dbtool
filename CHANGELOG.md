@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1
+
+- `self-update` now tracks the newest **published release** instead of the `main`
+  branch; `--main` (or `DBTOOL_UPDATE_CHANNEL=main`) follows the branch, and
+  `DBTOOL_UPDATE_URL` still overrides both. `DBTOOL_REPO` points it at a fork.
+- Pushing a `vX.Y.Z` tag publishes the GitHub release: the workflow refuses a tag
+  that disagrees with `DBTOOL_VERSION`, takes the notes from this file, and attaches
+  `dbtool.sh` and `install.sh`.
+
 ## 1.2.0
 
 - `all_databases: true` turns an entry into a whole server: dbtool enumerates the
