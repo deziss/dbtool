@@ -7,6 +7,7 @@ One shell script, one config file (YAML **or** JSON). Handles **any server versi
 detecting the version at connect time and picking a matching client — native binaries when
 they're new enough, otherwise a throwaway `postgres:<major>` / `mysql:<major.minor>` /
 `mariadb:<major.minor>` container. Nothing is installed permanently.
+Which PostgreSQL versions work for what: [POSTGRES_SUPPORT.md](POSTGRES_SUPPORT.md).
 
 ```
 dbtool/
@@ -19,6 +20,7 @@ dbtool/
 │   └── dbtool-backup.timer
 ├── install.sh                # install or update in one command
 ├── CHANGELOG.md              # what changed between versions
+├── POSTGRES_SUPPORT.md       # PostgreSQL version support matrix
 ├── .github/workflows/ci.yml  # shellcheck + a real backup/restore round-trip
 └── LICENSE                   # GNU AGPL v3
 ```
@@ -108,7 +110,8 @@ databases:
 Recognised per-entry keys: `engine`, `host`, `port`, `user`, `password`, `password_env`,
 `password_file`, `database`, `sslmode`, `charset`, `format`, `jobs`, `schema_only`,
 `data_only`, `no_owner`, `clean`, `create`, `enabled`, `image`, `exclude_tables`,
-`include_tables`, `schemas`, `exclude_schemas`, `dump_args`, `restore_args`.
+`include_tables`, `schemas`, `exclude_schemas`, `dump_args`, `restore_args`, `search_path`
+(targets: the `search_path` a PostgreSQL restore runs with, see [Restore](#restore)).
 Aliases are accepted where obvious (`username`/`uname`, `pass`/`passwd`, `db`/`dbname`,
 `hostname`, `type`/`driver`, `dsn`/`database_url`).
 
@@ -234,6 +237,20 @@ dbtool restore -f /backup/db/app_dev_postgres_app_dev_20260907-020000.dump \
 
 `-t` accepts a name from `targets:` or from `databases:` (restoring back over the source).
 `--drop` prompts before destroying anything; add `-y` to skip the prompt in scripts.
+You do not need to run your app's migrations on the target first: the dump carries the schema.
+
+```bash
+# schema whose CHECK constraints call SQL functions that call other functions unqualified
+dbtool restore --latest app_dev -t staging_pg --drop --search-path public
+```
+
+pg_restore always runs with an empty `search_path`. If a CHECK constraint calls a SQL function
+whose body names another function without a schema (and has no `SET search_path` of its own),
+COPY fails with `function … does not exist … during inlining`. `--search-path public` (or
+`search_path: public` on the target) rewrites that one statement of the dump and restores
+single-stream (`-j` is not used); no object is changed. dbtool prints this hint when it sees
+the error. The lasting fix is in the schema: `ALTER FUNCTION f(...) SET search_path = public`,
+or schema-qualify the inner call.
 
 ## Migrate to another server
 
@@ -248,7 +265,8 @@ dbtool migrate --from crm_mysql  --to new_server_mysql --target-db crm_mysql_v2 
 Add `--via-file` if you'd rather keep the dump on disk (it takes a normal backup, then restores
 it — good for cut-overs where you want an artifact to fall back to). The tool resolves clients
 for source and target independently, so migrating **PostgreSQL 12 → 17** or **MySQL 5.7 → 8.4**
-works from one box. Cross-engine (Postgres → MySQL) is refused deliberately; that needs an ETL
+works from one box (downgrades such as 17 → 15 do not; see
+[POSTGRES_SUPPORT.md](POSTGRES_SUPPORT.md)). `--search-path` works here too, as for `restore`. Cross-engine (Postgres → MySQL) is refused deliberately; that needs an ETL
 tool, not a dump pipe.
 
 Typical cut-over:
@@ -323,6 +341,7 @@ the containerised client exactly as it is from the host.
 | `cannot pull a postgres:<n> client image` | Registry unreachable. Pre-pull on a connected host, push to `registry.example.com`, and set `image:` on the entry to your mirrored tag. |
 | MySQL dump fails on `PROCESS privilege` | Already handled with `--no-tablespaces`; if a custom `dump_args` overrides it, put it back. |
 | `pg_restore: error: could not execute query … already exists` | Target isn't empty. Use `--drop`, or set `clean: true` on the target for `--clean --if-exists`. |
+| `function X(...) does not exist` … `during inlining` while COPYing a table | A CHECK constraint calls a SQL function whose body names another function without a schema, and pg_restore runs with an empty `search_path`. Restore with `--search-path public` (or `search_path: public` on the target; single-stream, `-j` unused). Permanent fix in the app schema: `ALTER FUNCTION f(...) SET search_path = public` or schema-qualify the call. Migrating the target first does not help. |
 | Restore is slow | Custom/directory dumps restore with `-j <jobs>`; raise `jobs` in `defaults` or on the target entry. |
 | `zstd not installed — falling back to gzip` | Install `zstd`, or set `compression: gzip` to silence it. |
 

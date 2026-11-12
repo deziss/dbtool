@@ -23,7 +23,7 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.2.1"
+readonly DBTOOL_VERSION="1.2.2"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
@@ -328,6 +328,7 @@ def build_entry(entry):
         'NO_OWNER': entry.get('no_owner', True),
         'CLEAN': entry.get('clean', False),
         'CREATE_DB': entry.get('create', False),
+        'SEARCH_PATH': entry.get('search_path') or '',
         'IMAGE': entry.get('image') or '',
         'ENABLED': entry.get('enabled', True),
         # treat this entry as a whole server: enumerate its databases at run time
@@ -531,7 +532,7 @@ acquire_lock() {
 use_ctx() {
     local p="$1" k
     for k in ENGINE HOST PORT USER PASS DB SSLMODE CHARSET LABEL FORMAT JOBS \
-             SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE ALL_DATABASES; do
+             SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE ALL_DATABASES SEARCH_PATH; do
         eval "CTX_$k=\"\$(gv ${p}${k})\""
     done
     for k in EXCLUDE INCLUDE EXCLUDE_SCHEMA SCHEMA DUMP_ARGS RESTORE_ARGS EXCLUDE_DB INCLUDE_DB; do
@@ -1210,6 +1211,9 @@ pg_db_exists() { [[ "$(_pg_query postgres "SELECT 1 FROM pg_database WHERE datna
 
 pg_prepare_target() {  # <create> <drop>
     local create="$1" drop="$2"
+    # validated here, before --drop can touch anything
+    [[ -z ${CTX_SEARCH_PATH:-} || $CTX_SEARCH_PATH =~ ^[A-Za-z0-9_\$\ ,\"]+$ ]] \
+        || die "search_path has unexpected characters: $CTX_SEARCH_PATH"
     if [[ $drop == true ]]; then
         confirm "DROP DATABASE ${CTX_DB} on ${CTX_HOST}:${CTX_PORT}?" || die "aborted by user"
         log "dropping database $CTX_DB"
@@ -1241,6 +1245,47 @@ my_prepare_target() {  # <create> <drop>
     fi
 }
 
+# pg_dump starts every restore with set_config('search_path', '', false), so
+# anything evaluated during COPY sees an empty search_path. A CHECK constraint
+# calling a SQL function whose body names another function without a schema
+# (and that has no SET search_path of its own) then fails with
+# "function … does not exist … during inlining". The dump is fine; the schema
+# relies on search_path. --search-path / search_path: restores single-stream
+# with that one statement rewritten, leaving every object untouched.
+_pg_restore_hint() {  # <stderr file>
+    grep -q 'during inlining\|function .* does not exist' "$1" 2>/dev/null || return 0
+    warn "a function in this schema calls another without a schema prefix, and pg_restore"
+    warn "runs with an empty search_path. Retry with --search-path public (or set"
+    warn "search_path: public on the target), and fix the schema: ALTER FUNCTION … SET search_path = public"
+}
+
+pg_restore_archive() {  # <jobs> [archive args...]   (no archive args = read stdin)
+    local jobs="$1"; shift
+    local errf="$RUNDIR/restore.err" rc=0
+    local -a conn=(-h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$CTX_DB" --no-password)
+    local -a opts=(--no-owner --no-acl)
+    [[ $CTX_CLEAN == true ]] && opts+=(--clean --if-exists)
+    opts+=(${CTX_RESTORE_ARGS[@]+"${CTX_RESTORE_ARGS[@]}"})
+    : >"$errf"
+    if [[ -n ${CTX_SEARCH_PATH:-} ]]; then
+        log "restoring single-stream with search_path=${CTX_SEARCH_PATH} (parallel jobs not used)"
+        pg_run pg_restore "${opts[@]}" -f - "$@" \
+            | awk -v sp="$CTX_SEARCH_PATH" -v q="'" -v dry="$DRY_RUN" '
+                BEGIN { from = "SELECT pg_catalog.set_config(" q "search_path" q ", " q q ", false);"
+                        to   = "SELECT pg_catalog.set_config(" q "search_path" q ", " q sp q ", false);" }
+                !done && $0 == from { print to; done = 1; next }
+                { print }
+                END { if (!done && dry != "true") print "dbtool: search_path statement not found in the dump; restored unchanged" > "/dev/stderr" }' \
+            | pg_run psql "${conn[@]}" -X -q -v ON_ERROR_STOP=1 -f - >/dev/null 2> >(tee "$errf" >&2) || rc=$?
+    else
+        local -a par=(); [[ -n $jobs ]] && par=(-j "$jobs")
+        pg_run pg_restore "${conn[@]}" "${opts[@]}" --exit-on-error ${par[@]+"${par[@]}"} "$@" \
+            2> >(tee "$errf" >&2) || rc=$?
+    fi
+    wait 2>/dev/null || true   # let tee flush before reading the file
+    (( rc == 0 )) || { _pg_restore_hint "$errf"; die "pg_restore failed (exit $rc)"; }
+}
+
 restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
     local file="$1" create="$2" drop="$3" start=$SECONDS
     [[ -f $file ]] || die "backup file not found: $file"
@@ -1259,20 +1304,16 @@ restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
         case "$file" in
             *.dump)
                 DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
-                local -a pr=("${rargs[@]}" --no-owner --no-acl --exit-on-error -j "$CTX_JOBS")
-                [[ $CTX_CLEAN == true ]] && pr+=(--clean --if-exists)
-                pr+=(${CTX_RESTORE_ARGS[@]+"${CTX_RESTORE_ARGS[@]}"} "$file")
-                log "restoring custom-format dump into ${CTX_HOST}:${CTX_PORT}/${CTX_DB} (-j $CTX_JOBS)"
-                pg_run pg_restore "${pr[@]}"
+                log "restoring custom-format dump into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}$([[ -n ${CTX_SEARCH_PATH:-} ]] || echo " (-j $CTX_JOBS)")"
+                pg_restore_archive "$CTX_JOBS" "$file"
                 DOCKER_EXTRA=() ;;
             *.dir.tar*)
                 local xdir="$RUNDIR/restore.dir"; mkdir -p "$xdir"
                 decompress_stream "$file" | tar -C "$xdir" -xf -
                 local inner; inner="$(find "$xdir" -maxdepth 1 -mindepth 1 -type d | head -1)"
                 DOCKER_EXTRA=(-v "$RUNDIR":"$RUNDIR":ro)
-                log "restoring directory-format dump (-j $CTX_JOBS)"
-                pg_run pg_restore "${rargs[@]}" --no-owner --no-acl --exit-on-error -j "$CTX_JOBS" \
-                    ${CTX_RESTORE_ARGS[@]+"${CTX_RESTORE_ARGS[@]}"} -Fd "$inner"
+                log "restoring directory-format dump$([[ -n ${CTX_SEARCH_PATH:-} ]] || echo " (-j $CTX_JOBS)")"
+                pg_restore_archive "$CTX_JOBS" -Fd "$inner"
                 DOCKER_EXTRA=() ;;
             *)
                 log "restoring plain SQL into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
@@ -1287,7 +1328,7 @@ restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
 }
 
 cmd_restore() {
-    local file="" src_name="" tgt="" tgt_db="" create=false drop=false use_latest=false
+    local file="" src_name="" tgt="" tgt_db="" create=false drop=false use_latest=false search_path=""
     while (( $# )); do
         case "$1" in
             -f|--file)     file="$2"; shift 2 ;;
@@ -1296,6 +1337,7 @@ cmd_restore() {
             -d|--database) tgt_db="$2"; shift 2 ;;
             --create)      create=true; shift ;;
             --drop)        drop=true; shift ;;
+            --search-path) search_path="$2"; shift 2 ;;
             *) die "restore: unknown option $1" ;;
         esac
     done
@@ -1310,6 +1352,7 @@ cmd_restore() {
     fi
     use_ctx DST_
     [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
+    [[ -n $search_path ]] && CTX_SEARCH_PATH="$search_path"
     [[ $CTX_CREATE_DB == true ]] && create=true
     confirm "Restore $(basename "$file") into ${CTX_ENGINE} ${CTX_HOST}:${CTX_PORT}/${CTX_DB}?" || die "aborted by user"
     restore_into_ctx "$file" "$create" "$drop"
@@ -1319,7 +1362,7 @@ cmd_restore() {
 #  MIGRATE  (server -> server, streaming by default)
 # ===========================================================================
 cmd_migrate() {
-    local from="" to="" tgt_db="" create=false drop=false via_file=false
+    local from="" to="" tgt_db="" create=false drop=false via_file=false search_path=""
     while (( $# )); do
         case "$1" in
             -s|--from)     from="$2"; shift 2 ;;
@@ -1328,6 +1371,7 @@ cmd_migrate() {
             --create)      create=true; shift ;;
             --drop)        drop=true; shift ;;
             --via-file)    via_file=true; shift ;;
+            --search-path) search_path="$2"; shift 2 ;;
             *) die "migrate: unknown option $1" ;;
         esac
     done
@@ -1345,6 +1389,7 @@ cmd_migrate() {
         local f; f="$(cat "$RUNDIR/last_backup")"
         use_ctx DST_
         [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
+        [[ -n $search_path ]] && CTX_SEARCH_PATH="$search_path"
         [[ $CTX_CREATE_DB == true ]] && create=true
         confirm "Restore $(basename "$f") into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}?" || die "aborted by user"
         restore_into_ctx "$f" "$create" "$drop"
@@ -1366,6 +1411,7 @@ cmd_migrate() {
 
     use_ctx DST_
     [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
+    [[ -n $search_path ]] && CTX_SEARCH_PATH="$search_path"
     [[ $CTX_CREATE_DB == true ]] && create=true
     resolve_client
 
@@ -1375,10 +1421,6 @@ cmd_migrate() {
     local start=$SECONDS
     if [[ $s_engine == postgres ]]; then
         pg_prepare_target "$create" "$drop"
-        local -a pr=(-h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$CTX_DB" --no-password
-                     --no-owner --no-acl --exit-on-error)
-        [[ $CTX_CLEAN == true ]] && pr+=(--clean --if-exists)
-        pr+=(${CTX_RESTORE_ARGS[@]+"${CTX_RESTORE_ARGS[@]}"})
         if $DRY_RUN; then
             log "would run: pg_dump [source] -Fc -Z0 | pg_restore [target]"; return 0
         fi
@@ -1386,7 +1428,7 @@ cmd_migrate() {
           CTX_HOST="$S_HOST"; CTX_PORT="$S_PORT"; CTX_USER="$S_USER"; CTX_PASS="$S_PASS"
           CTX_SSLMODE="$S_SSL"; PG_MODE="$S_PGMODE"; PG_IMAGE="$S_PGIMG"
           pg_run pg_dump "${S_DUMPARGS[@]}" -Fc -Z 0
-        ) | pg_run pg_restore "${pr[@]}"
+        ) | pg_restore_archive ""
     else
         my_prepare_target "$create" "$drop"
         if $DRY_RUN; then log "would run: mysqldump [source] | mysql [target]"; return 0; fi
@@ -1833,9 +1875,9 @@ USAGE
 COMMANDS
   backup [name|all]              Dump one, several (comma-separated) or all databases
   restore -f FILE -t TARGET      Restore a dump into a target (or --latest NAME)
-          [--database DB] [--create] [--drop]
+          [--database DB] [--create] [--drop] [--search-path public]
   migrate --from SRC --to TGT    Stream a database to another server
-          [--target-db DB] [--create] [--drop] [--via-file]
+          [--target-db DB] [--create] [--drop] [--via-file] [--search-path public]
   globals                        Dump cluster roles/grants for every postgres server
   discover [name|all]            List every database on the configured servers and
            [--url DSN]           show which ones the config does not cover

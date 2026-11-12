@@ -115,6 +115,7 @@ targets:
     create: true                    # CREATE DATABASE if missing
     clean: false                    # pg_restore --clean --if-exists
     restore_args: ["--no-owner", "--no-privileges"]
+    # search_path: public          # for schemas whose functions call others unqualified
 
   new_server_pg:
     engine: postgres

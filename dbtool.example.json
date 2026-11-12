@@ -100,7 +100,8 @@
       "database": "app_dev",
       "create": true,
       "clean": false,
-      "restore_args": ["--no-owner", "--no-privileges"]
+      "restore_args": ["--no-owner", "--no-privileges"],
+      "search_path": ""
     },
     "new_server_pg": {
       "engine": "postgres",

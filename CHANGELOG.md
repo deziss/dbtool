@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.2
+
+- `restore` / `migrate --search-path public` (or `search_path:` on a target) restore a
+  PostgreSQL dump whose CHECK constraints call SQL functions that name other functions
+  without a schema. pg_restore runs with an empty `search_path`, so those failed with
+  `function … does not exist … during inlining`; dbtool now rewrites that one statement
+  and restores single-stream. A failed restore that hits this prints the fix.
+- `POSTGRES_SUPPORT.md`: which PostgreSQL server versions each command supports, which
+  cross-version restores and migrations work, and how the client is chosen.
+
 ## 1.2.1
 
 - `self-update` now tracks the newest **published release** instead of the `main`
