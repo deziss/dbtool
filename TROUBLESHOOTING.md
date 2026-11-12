@@ -11,6 +11,8 @@ Quick reference first; the longer cases follow below it.
 | `function X(...) does not exist` … `during inlining` while COPYing a table | See [Restore fails: function does not exist during inlining](#restore-fails-function-does-not-exist-during-inlining). |
 | `pg_restore: error: unsupported version (…) in file header` | Restoring a dump into an **older** PostgreSQL major. Not supported; see [POSTGRES_SUPPORT.md](POSTGRES_SUPPORT.md). |
 | `write /dev/stdout: broken pipe` after a restore error | Harmless: the dump reader was still writing when the restore stopped on the real error printed above it. |
+| `data verification FAILED` after a restore | See [Reading a data verification report](#reading-a-data-verification-report). |
+| `checksum MISMATCH … refusing to restore it` | The dump changed after it was written (disk/copy damage, or edited). Use another dump; `dbtool verify FILE` to confirm. |
 | Restore is slow | Custom/directory dumps restore with `-j <jobs>`; raise `jobs` in `defaults` or on the target entry. (`--search-path` restores are single-stream.) |
 | `zstd not installed — falling back to gzip` | Install `zstd`, or set `compression: gzip` to silence it. |
 
@@ -95,3 +97,34 @@ ALTER FUNCTION model_role_capabilities_eligible(jsonb, text) SET search_path = a
 
 Do this for every SQL function used in a CHECK, index or generated column that calls other
 functions unqualified. After that, plain restores work and `--search-path` is not needed.
+
+## Reading a data verification report
+
+`--verify-data`, `compare` and `drill` print what differs and write the full table to
+`<backup_dir>/reports/verify_<target>_<time>.txt`.
+
+| Status | Against the **dump** (or the source snapshot) | What to do |
+|---|---|---|
+| `OK rows` / `OK rows+checksum` | Identical. | Nothing to do. |
+| `MISSING in restored` | The dump has data for a table that the restore doesn't have. | The restore failed part-way, or a filter (`restore_args`, `-n`) skipped it. Restore again. |
+| `ROW COUNT DIFFERS (±N)` | Rows were lost or added. | Restore again with `--drop`. Check for triggers on the target that insert or delete during load. |
+| `DATA DIFFERS (checksum)` | Same number of rows, different values. | See the checksum caveats below. Otherwise the copy is corrupt; restore again. |
+| `SEQUENCE BEHIND` | A sequence is lower than in the dump. | New inserts would collide with existing ids. Fix it with `SELECT setval(...)` or restore again. |
+| `OBJECT COUNT DIFFERS` | Functions, indexes, constraints, triggers or views are missing or extra. | Look for errors in the restore log. A target that was not empty (no `--drop`) shows extras. |
+| `only in restored` (warning) | The target has a table that the dump doesn't. | The target was not empty. Use `--drop` for a clean copy. |
+| `source +N rows since backup` (info) | The live source has changed since the dump. | Expected on a live system. Not a restore problem. |
+
+Without a dump fingerprint (comparing two live databases), every difference is reported as
+a failure, because dbtool cannot tell writes made after the backup apart from real loss.
+Compare against the dump (`--latest NAME` or `--dump FILE`) for an exact verdict.
+
+**Checksum caveats.** Checksums hash each row's text form. dbtool fixes the session settings
+that change that text (`TimeZone`, `DateStyle`, `IntervalStyle`, `extra_float_digits`,
+`bytea_output`, `lc_monetary`), so the same data hashes the same on both sides. A checksum
+can still differ while the data is the same if:
+- the target runs a different PostgreSQL **major** version and a type's text form changed
+  between versions;
+- a column type has no stable text form;
+- a type's output depends on the server's locale.
+
+In those cases rely on `counts`, and spot-check the table by hand.

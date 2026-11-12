@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3.0
+
+- **Data verification.** Backups write `<dump>.fingerprint.tsv`, containing per-table row
+  counts (plus an order-independent content checksum with `fingerprint: full`), sequence values
+  and object counts. These are taken in the same exported snapshot pg_dump uses, so they
+  describe exactly what is in the dump, even on a live source.
+- `restore` / `migrate --verify-data [counts|full]` (or `verify_data:` on a target) compare the
+  restored database with the dump's fingerprint and, for `--latest` of a configured source,
+  with the live source. Drift on the live source is reported as information only. Exits 1 on
+  any difference and writes a report to `<backup_dir>/reports/`. A streaming migrate
+  fingerprints the source in the snapshot it streams from.
+- `dbtool compare [SOURCE] TARGET [--dump FILE | --latest NAME] [--full]` runs the same check at
+  any time. For older dumps without a fingerprint it counts the rows in the dump's COPY data.
+- `dbtool drill NAME -t SCRATCH` is a restore drill: it restores the newest backup, verifies
+  it, prints the backup's age (RPO) and how long recovery took (RTO), then drops the scratch
+  database.
+- A restore now **refuses** a dump whose `.sha256` does not match (it used to warn and carry
+  on), and runs `ANALYZE` after loading (`--no-analyze` to skip).
+- `SOP.md`: the operating procedure for backup, restore, migration and restore drills.
+- Entries filtered with `exclude_tables` / `schemas` / `-t` / `-n` record only the tables
+  pg_dump really carries (asked of pg_dump in the same snapshot); object counts are not
+  recorded for them. Inheritance parents are counted `ONLY`.
+- `drill` refuses a target that points at a database a configured source backs up.
+
 ## 1.2.3
 
 - `--search-path auto` builds the search_path from the schemas that own functions in

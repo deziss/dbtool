@@ -181,6 +181,24 @@ jobs:
           echo "restored rows: $n"
           [ "$n" = "1000" ]
 
+      - name: data verification catches a corrupted restore
+        env:
+          PGPASSWORD: ci_password
+        run: |
+          f=$(ls -t "$RUNNER_TEMP"/backups/ci_db_postgres_*.dump | head -1)
+          test -s "$f.fingerprint.tsv" || { echo "::error::no fingerprint sidecar"; exit 1; }
+          grep -q '"fingerprint": "counts"' "$f.meta.json"
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" restore --latest ci_db -t ci_restore --drop --verify-data full -y
+          ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" compare ci_db ci_restore --full
+          psql -h 127.0.0.1 -U postgres -d ci_restored -c "delete from t where id = 7"
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" compare ci_restore --latest ci_db; then
+            echo "::error::compare missed a deleted row"; exit 1
+          fi
+          rm -f "$f.fingerprint.tsv"   # an older dump: counts come from the dump data
+          if ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" compare ci_restore --dump "$f"; then
+            echo "::error::compare (dump data) missed a deleted row"; exit 1
+          fi
+
       - name: cluster globals are dumped
         run: |
           ./dbtool.sh -c "$RUNNER_TEMP/dbtool.yml" globals

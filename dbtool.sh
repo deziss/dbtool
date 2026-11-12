@@ -23,7 +23,7 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.2.3"
+readonly DBTOOL_VERSION="1.3.0"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
@@ -329,6 +329,7 @@ def build_entry(entry):
         'CLEAN': entry.get('clean', False),
         'CREATE_DB': entry.get('create', False),
         'SEARCH_PATH': entry.get('search_path') or '',
+        'VERIFY_DATA': entry.get('verify_data', ''),
         'IMAGE': entry.get('image') or '',
         'ENABLED': entry.get('enabled', True),
         # treat this entry as a whole server: enumerate its databases at run time
@@ -409,6 +410,7 @@ DRY_RUN=false
 ASSUME_YES=false
 QUIET=false
 NO_UPLOAD=false
+NO_ANALYZE=false
 
 CFG_BACKUP_DIR="/var/backups/dbtool"
 CFG_LOG_FILE=""
@@ -424,6 +426,7 @@ CFG_TIMEOUT=7200
 CFG_TIMESTAMP_FORMAT="%Y%m%d-%H%M%S"
 CFG_MAINTENANCE_DB="postgres"     # database used to enumerate / create / drop
 CFG_VERIFY="full"                 # full | header | none"
+CFG_FINGERPRINT="counts"          # counts | full | none — data fingerprint taken in the dump's snapshot
 CFG_INCLUDE_GLOBALS=true          # dump cluster roles/grants alongside 'backup all'
 CFG_LOCK=true                     # refuse to run while another dbtool holds the lock
 
@@ -442,6 +445,7 @@ declare -a DOCKER_EXTRA=()
 declare -a CLEAN_PATHS=()
 
 cleanup() {
+    ${SNAP_ON:-false} && pg_snapshot_close
     rm -rf "$RUNDIR" 2>/dev/null || true
     local p
     for p in ${CLEAN_PATHS[@]+"${CLEAN_PATHS[@]}"}; do
@@ -532,7 +536,7 @@ acquire_lock() {
 use_ctx() {
     local p="$1" k
     for k in ENGINE HOST PORT USER PASS DB SSLMODE CHARSET LABEL FORMAT JOBS \
-             SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE ALL_DATABASES SEARCH_PATH; do
+             SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE ALL_DATABASES SEARCH_PATH VERIFY_DATA; do
         eval "CTX_$k=\"\$(gv ${p}${k})\""
     done
     for k in EXCLUDE INCLUDE EXCLUDE_SCHEMA SCHEMA DUMP_ARGS RESTORE_ARGS EXCLUDE_DB INCLUDE_DB; do
@@ -834,6 +838,8 @@ build_pg_dump_args() {  # populates DUMPARGS
     for t in ${CTX_SCHEMA[@]+"${CTX_SCHEMA[@]}"};          do DUMPARGS+=(--schema="$t"); done
     for t in ${CTX_EXCLUDE_SCHEMA[@]+"${CTX_EXCLUDE_SCHEMA[@]}"}; do DUMPARGS+=(--exclude-schema="$t"); done
     DUMPARGS+=(${CTX_DUMP_ARGS[@]+"${CTX_DUMP_ARGS[@]}"})
+    [[ -n ${SNAP_ID:-} ]] && DUMPARGS+=(--snapshot="$SNAP_ID")
+    return 0
 }
 
 build_my_dump_args() {  # populates DUMPARGS
@@ -925,7 +931,7 @@ sweep_stale_parts() {
 backups_for() {  # backups_for <entry-name>  -> newest first, one path per line
     find "$CFG_BACKUP_DIR" -maxdepth 1 -type f \
          \( -name "$1_postgres_*" -o -name "$1_mysql_*" \) \
-         ! -name '*.sha256' ! -name '*.meta.json' ! -name '*.part' \
+         ! -name '*.sha256' ! -name '*.meta.json' ! -name '*.fingerprint.tsv' ! -name '*.part' \
          -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}'
 }
 
@@ -948,6 +954,7 @@ write_meta() {  # write_meta <file> <engine> <serverver> <format>
   "created_on": "$(hostname)",
   "size_bytes": $size,
   "sha256": "$sum",
+  "fingerprint": "${FP_META:-none}",
   "dbtool_version": "$DBTOOL_VERSION"
 }
 JSON
@@ -1001,8 +1008,21 @@ backup_one() {
     base="${CFG_BACKUP_DIR}/${label}_${CTX_ENGINE}_${CTX_DB}_${ts}"
     start=$SECONDS
 
+    local fp_mode="${CFG_FINGERPRINT:-counts}" fp_tmp=""
+    FP_META="none"
+    if [[ $CTX_ENGINE == postgres && $fp_mode != none && $CTX_SCHEMA_ONLY != true ]] && ! $DRY_RUN; then
+        fp_tmp="$RUNDIR/fp.backup.tsv"
+        if pg_snapshot_open && pg_snapshot_run "$(pg_fingerprint_sql "$fp_mode")" "$fp_tmp"; then
+            log "fingerprint ($fp_mode) taken in snapshot $SNAP_ID; pg_dump will use the same snapshot"
+        else
+            warn "could not fingerprint $label: $(pg_snapshot_err)— dumping without one"
+            pg_snapshot_close; fp_tmp=""
+        fi
+    fi
+
     if [[ $CTX_ENGINE == postgres ]]; then
         build_pg_dump_args
+        [[ -n $fp_tmp ]] && fp_filter_by_dump_args "$fp_tmp"
         case "$CTX_FORMAT" in
             custom)
                 final="${base}.dump"; tmp="$(dump_target "$final")"
@@ -1040,6 +1060,7 @@ backup_one() {
             || { rm -f "$tmp"; die "mysqldump failed for $label"; }
     fi
 
+    pg_snapshot_close
     $DRY_RUN && { ok "dry-run: $label"; return 0; }
     [[ -s $tmp ]] || { rm -f "$tmp"; die "dump produced an empty file for $label"; }
     mv "$tmp" "$final"
@@ -1047,6 +1068,13 @@ backup_one() {
 
     verify_dump_artifact "$final" || { rm -f "$final"; die "integrity check failed — discarded $(basename "$final")"; }
 
+    if [[ -n $fp_tmp && -s $fp_tmp ]]; then
+        { printf '# dbtool fingerprint v1  mode=%s  server=%s  source=%s:%s/%s  taken=%s\n' \
+              "$fp_mode" "$PG_SERVER_VER" "$CTX_HOST" "$CTX_PORT" "$CTX_DB" "$(date -Iseconds)"
+          grep -v '^$' "$fp_tmp"; } >"${final}.fingerprint.tsv"
+        chmod 640 "${final}.fingerprint.tsv"
+        FP_META="$fp_mode"
+    fi
     write_meta "$final" "$CTX_ENGINE" "${PG_SERVER_VER:-$MY_SERVER_VER}" "$CTX_FORMAT"
     elapsed=$((SECONDS - start))
     size="$(stat -c %s "$final" 2>/dev/null || stat -f %z "$final")"
@@ -1054,6 +1082,7 @@ backup_one() {
     upload_file "$final"
     upload_file "${final}.sha256"
     upload_file "${final}.meta.json"
+    [[ -f "${final}.fingerprint.tsv" ]] && upload_file "${final}.fingerprint.tsv"
     printf '%s' "$final" >"$RUNDIR/last_backup"
 }
 
@@ -1177,13 +1206,397 @@ prune_backups() {
             (( idx <= keep )) && continue
             if [[ -n $(find "$f" -mtime "+$((days-1))" -print -quit 2>/dev/null) ]]; then
                 $DRY_RUN && { log "would prune $(basename "$f")"; continue; }
-                rm -f "$f" "${f}.sha256" "${f}.meta.json"
+                rm -f "$f" "${f}.sha256" "${f}.meta.json" "${f}.fingerprint.tsv"
                 removed=$((removed+1))
             fi
         done
     done
     (( removed > 0 )) && log "pruned $removed old backup(s) (retention ${days}d, keep ${keep})"
     return 0
+}
+
+# ===========================================================================
+#  DATA VERIFICATION — fingerprints of the live source, the dump, the restore
+# ===========================================================================
+# A fingerprint is one tab-separated line per fact, all taken in one
+# REPEATABLE READ snapshot so every line describes the same moment:
+#   table    <schema> <name> <rows>        <checksum | ->
+#   seq      <schema> <name> <last_value>  -
+#   objects  <schema> <kind> <count>       -
+# The checksum is an order-independent sum of md5(row) — equal sets of rows
+# give equal sums whatever the physical order, and one changed value changes it.
+# Backups take theirs in the same snapshot pg_dump uses (pg_export_snapshot),
+# so "restored vs dump" is exact even though the source kept changing.
+
+FP_NS_FILTER="n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_(toast|temp)'"
+
+pg_fingerprint_sql() {  # <counts|full> [server-major]  -> psql script (run inside a transaction)
+    local mode="$1" major="${2:-${PG_SERVER_MAJOR:-17}}" ck="'-'" sql
+    [[ $mode == full ]] && ck="coalesce(sum(('x'||left(md5(ROW(r.*)::text),16))::bit(64)::bigint::numeric),0)::text"
+    # Pin every setting that changes how a value prints, so both sides hash the same text.
+    sql=$(cat <<'SQL'
+SET TimeZone = 'UTC';
+SET DateStyle = 'ISO, YMD';
+SET IntervalStyle = 'postgres';
+SET extra_float_digits = 3;
+SET bytea_output = 'hex';
+SET lc_monetary = 'C';
+\pset fieldsep '\t'
+SELECT format('SELECT %L, %L, %L, count(*), %s FROM ONLY %I.%I r', 'table', n.nspname, c.relname,
+              $ck$@CK@$ck$, n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind = 'r' AND @NS@
+ ORDER BY n.nspname, c.relname
+\gexec
+SELECT 'objects', nspname, kind, count(*), '-' FROM (
+    SELECT n.nspname, 'functions' AS kind FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE @NS@
+    UNION ALL
+    SELECT n.nspname, CASE WHEN c.relkind IN ('i','I') THEN 'indexes' WHEN c.relkind IN ('v','m') THEN 'views' ELSE 'sequences' END
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('i','I','v','m','S') AND @NS@
+    UNION ALL
+    SELECT n.nspname, 'constraints' FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace
+     WHERE k.contype IN ('c','f','p','u','x') AND @NS@
+    UNION ALL
+    SELECT n.nspname, 'triggers' FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace WHERE NOT t.tgisinternal AND @NS@
+) o GROUP BY nspname, kind ORDER BY nspname, kind;
+SQL
+)
+    if (( ${major%%.*} >= 10 )); then
+        sql+=$'\n'"SELECT 'seq', schemaname, sequencename, coalesce(last_value::text, 'unset'), '-' FROM pg_sequences ORDER BY 2, 3;"
+    fi
+    sql="${sql//@CK@/$ck}"
+    printf '%s\n' "${sql//@NS@/$FP_NS_FILTER}"
+}
+
+# --- a psql session that holds an exported snapshot open (bash coproc) -------
+SNAP_ID=""; SNAP_ON=false; SNAP_W=""; SNAP_R=""
+pg_snapshot_open() {  # CTX_* = the source. Sets SNAP_ID.
+    SNAP_ID=""
+    $DRY_RUN && return 1
+    : >"$RUNDIR/snap.err"
+    coproc PGSNAP { pg_run psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$CTX_DB" --no-password \
+                    -qtAX -v ON_ERROR_STOP=1 2>>"$RUNDIR/snap.err"; }
+    # keep our own copies: bash closes and unsets PGSNAP when the coproc exits
+    [[ -n ${PGSNAP[1]:-} && -n ${PGSNAP[0]:-} ]] || { warn "snapshot session ended at once: $(pg_snapshot_err)"; return 1; }
+    exec {SNAP_W}>&"${PGSNAP[1]}" {SNAP_R}<&"${PGSNAP[0]}"
+    SNAP_ON=true
+    local out="$RUNDIR/snap.id"
+    pg_snapshot_run $'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;\nSELECT pg_export_snapshot();' "$out" || return 1
+    SNAP_ID="$(grep -v '^$' "$out" | tail -1)"
+    [[ -n $SNAP_ID ]]
+}
+
+pg_snapshot_run() {  # <sql> <outfile>  -> runs inside the snapshot session
+    local line rc=1
+    $SNAP_ON || return 1
+    # a write to a session that already died must fail, not SIGPIPE the whole tool
+    ( trap '' PIPE; printf '%s\n\\echo __DBTOOL_END__\n' "$1" >&"$SNAP_W" ) 2>/dev/null || return 1
+    : >"$2"
+    while IFS= read -r line <&"$SNAP_R"; do
+        [[ $line == __DBTOOL_END__ ]] && { rc=0; break; }
+        printf '%s\n' "$line" >>"$2"
+    done
+    return $rc
+}
+
+pg_snapshot_close() {
+    $SNAP_ON || return 0
+    SNAP_ON=false; SNAP_ID=""
+    ( trap '' PIPE; printf 'COMMIT;\n\\q\n' >&"$SNAP_W" ) 2>/dev/null || true
+    exec {SNAP_W}>&- {SNAP_R}<&-
+    wait "${PGSNAP_PID:-}" 2>/dev/null || true
+}
+
+pg_snapshot_err() { grep -v '^$' "$RUNDIR/snap.err" 2>/dev/null | tail -2 | tr '\n' ' '; }
+
+# --- fingerprint a live database (CTX_* + resolved client) ---------------------
+fingerprint_ctx() {  # <counts|full> <outfile>
+    local script
+    script="BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;"$'\n'"$(pg_fingerprint_sql "$1")"$'\n'"COMMIT;"
+    DOCKER_EXTRA=()
+    if ! printf '%s\n' "$script" | pg_run psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$CTX_DB" \
+            --no-password -qtAX -v ON_ERROR_STOP=1 -f - >"$2.raw" 2>"$RUNDIR/fp.err"; then
+        warn "fingerprint of ${CTX_HOST}:${CTX_PORT}/${CTX_DB} failed: $(grep -v '^$' "$RUNDIR/fp.err" | tail -2 | tr '\n' ' ')"
+        return 1
+    fi
+    grep -v '^$' "$2.raw" >"$2" || true
+}
+
+# --- row counts read straight from a dump's COPY data (dumps without a sidecar) -
+FP_COPY_AWK='
+function unq(s) { if (s ~ /^".*"$/) { s = substr(s, 2, length(s) - 2); gsub(/""/, "\"", s) } return s }
+/^COPY / && / FROM stdin;$/ {
+    rest = substr($0, 6); sch = "public"
+    if (match(rest, /^("([^"]|"")*"|[^."]+)\./)) { sch = substr(rest, 1, RLENGTH - 1); rest = substr(rest, RLENGTH + 1) }
+    tbl = rest; if (match(rest, /^("([^"]|"")*"|[^ "]+)/)) tbl = substr(rest, 1, RLENGTH)
+    sch = unq(sch); tbl = unq(tbl); n = 0; incopy = 1; next
+}
+incopy && $0 == "\\." { printf "table\t%s\t%s\t%d\t-\n", sch, tbl, n; incopy = 0; next }
+incopy { n++ }'
+
+dump_row_counts() {  # <dump file> <outfile>   (client already picked for the dump)
+    local f="$1" fdir; fdir="$(cd "$(dirname "$f")" && pwd)"
+    case "$f" in
+        *.dump)
+            DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
+            pg_run pg_restore --data-only -f - "$fdir/$(basename "$f")" | awk "$FP_COPY_AWK" >"$2"
+            DOCKER_EXTRA=() ;;
+        *.dir.tar*)
+            local xdir="$RUNDIR/count.dir"; rm -rf "$xdir"; mkdir -p "$xdir"
+            decompress_stream "$f" | tar -C "$xdir" -xf -
+            local inner; inner="$(find "$xdir" -maxdepth 1 -mindepth 1 -type d | head -1)"
+            DOCKER_EXTRA=(-v "$RUNDIR":"$RUNDIR":ro)
+            pg_run pg_restore --data-only -f - -Fd "$inner" | awk "$FP_COPY_AWK" >"$2"
+            DOCKER_EXTRA=(); rm -rf "$xdir" ;;
+        *)  decompress_stream "$f" | awk "$FP_COPY_AWK" >"$2" ;;
+    esac
+}
+
+# pg_dump alone decides what a filtered entry (exclude_tables, schemas, -t/-n in dump_args)
+# leaves out, so ask it: a schema-only dump in the same snapshot lists exactly the tables the
+# real dump will carry. Object counts cannot be narrowed to a filter, so they are not recorded.
+fp_filter_by_dump_args() {  # <fingerprint>   (CTX_* = source, DUMPARGS built, snapshot open)
+    local fp="$1" toc="$RUNDIR/toc.list" da=" ${DUMPARGS[*]} "
+    [[ $da =~ [[:space:]](-[tTnN]|--(table|exclude-table|schema|exclude-schema))([=[:space:]]) ]] || return 0
+    awk -F'\t' '$1 != "objects"' "$fp" >"$fp.f" && mv "$fp.f" "$fp"
+    DOCKER_EXTRA=()
+    { pg_run pg_dump "${DUMPARGS[@]}" --schema-only -Fc -Z 0 | pg_run pg_restore -l 2>/dev/null \
+        | sed -n 's/^[0-9]*; [0-9]* [0-9]* TABLE \(.*\) [^ ]*$/\1/p' >"$toc"; } || true
+    [[ -s $toc ]] || return 0
+    awk -F'\t' 'NR == FNR { keep[$0] = 1; next }
+                $1 != "table" || (($2 " " $3) in keep)' "$toc" "$fp" >"$fp.f" && mv "$fp.f" "$fp"
+}
+
+# --- compare -------------------------------------------------------------------
+# compare_fingerprints <reference fp|""> <restored fp> <live fp|""> <reference label> <restored label>
+# Restored must equal the reference (the dump, or the source in the dump's
+# snapshot). The live source, when given, only explains drift since the backup.
+# With no reference, the live source is the reference. Writes a full report.
+FP_LAST_REPORT=""
+compare_fingerprints() {
+    local ref="$1" tgt="$2" live="$3" rlabel="$4" tlabel="$5" rc=0 rows="$RUNDIR/compare.rows"
+    local -a args=()
+    [[ -n $ref  && -s $ref  ]] && args+=(src=REF "$ref")
+    args+=(src=TGT "$tgt")
+    [[ -n $live && -s $live ]] && args+=(src=LIVE "$live")
+    awk -F'\t' -v OFS='\t' '
+        /^#/ || NF < 5 { next }
+        { k = $1 "\t" $2 "\t" $3; keys[k] = 1; cnt[src, k] = $4; ck[src, k] = $5; have[src] = 1; if ($1 == "objects") hasobj[src] = 1 }
+        function num(v) { return (v ~ /^-?[0-9]+$/) ? v + 0 : v }
+        END {
+            ref = ("REF" in have) ? "REF" : "LIVE"; three = ("REF" in have) && ("LIVE" in have)
+            for (k in keys) {
+                split(k, p, "\t"); kind = p[1]; obj = p[2] "." p[3]
+                r = ((ref, k) in cnt); t = (("TGT", k) in cnt); l = (("LIVE", k) in cnt)
+                rv = r ? cnt[ref, k] : "-"; tv = t ? cnt["TGT", k] : "-"; lv = l ? cnt["LIVE", k] : "-"
+                st = ""; sev = "ok"
+                if (kind == "table") {
+                    if (r || t) ntab++
+                    if (r && !t)       { st = "MISSING in restored"; sev = "fail" }
+                    else if (!r && t)  { st = "only in restored"; sev = "warn" }
+                    else if (!r && !t) { st = "new in source since backup"; sev = "info" }
+                    else if (rv != tv) { st = "ROW COUNT DIFFERS (" (num(tv) - num(rv)) ")"; sev = "fail" }
+                    else if (ck[ref, k] != "-" && ck["TGT", k] != "-" && ck[ref, k] != ck["TGT", k]) { st = "DATA DIFFERS (checksum)"; sev = "fail" }
+                    else { st = (ck[ref, k] != "-" && ck["TGT", k] != "-") ? "OK rows+checksum" : "OK rows"; trows += num(tv); nck += (st ~ /checksum/) }
+                    if (three && r && l) {
+                        if (lv != rv) st = st "; source " ((num(lv) - num(rv)) >= 0 ? "+" : "") (num(lv) - num(rv)) " rows since backup"
+                        else if (ck["LIVE", k] != "-" && ck["REF", k] != "-" && ck["LIVE", k] != ck["REF", k]) st = st "; source rows changed since backup"
+                    }
+                } else if (kind == "seq") {
+                    if (rv == "unset" || tv == "unset" || !r || !t) { st = "not comparable"; sev = "info" }
+                    else if (num(tv) < num(rv)) { st = "SEQUENCE BEHIND"; sev = "fail" }
+                    else if (num(tv) > num(rv)) { st = "ahead"; sev = (ref == "LIVE") ? "fail" : "warn" }
+                    else st = "OK"
+                    nseq++
+                } else {
+                    if (!(ref in hasobj)) { st = "not recorded in reference"; sev = "info" }
+                    else {
+                        if (!r) rv = 0; if (!t) tv = 0
+                        if (num(rv) != num(tv)) { st = "OBJECT COUNT DIFFERS"; sev = "fail" } else st = "OK"
+                    }
+                }
+                if (sev == "fail") nfail++; else if (sev == "warn") nwarn++
+                print kind, obj, (three ? lv : "-"), rv, tv, sev, st
+            }
+            printf "#SUMMARY\t%d\t%d\t%d\t%d\t%d\t%d\n", ntab, trows, nck, nseq, nfail, nwarn
+        }' "${args[@]}" | sort -t$'\t' -k1,1 -k2,2 >"$rows"
+
+    local summary; summary="$(grep '^#SUMMARY' "$rows")"
+    local ntab trows nck nseq nfail nwarn
+    IFS=$'\t' read -r _ ntab trows nck nseq nfail nwarn <<<"$summary"
+    local three=false; [[ -n $ref && -s $ref && -n $live && -s $live ]] && three=true
+    local rhead="$rlabel"; [[ -n $ref && -s $ref ]] || rhead="SOURCE(now)"
+
+    local report_dir="${CFG_BACKUP_DIR}/reports" ts; ts="$(date +"$CFG_TIMESTAMP_FORMAT")"
+    mkdir -p "$report_dir" 2>/dev/null || report_dir="$RUNDIR"
+    local report="${report_dir}/verify_$(printf '%s' "$tlabel" | tr -c '[:alnum:]._-' '_')_${ts}.txt"
+    {
+        printf '# dbtool %s data verification  %s\n' "$DBTOOL_VERSION" "$(date -Iseconds)"
+        printf '# restored : %s\n# reference: %s\n' "$tlabel" "$rhead"
+        $three && printf '# live     : source now (drift since the backup is informational)\n'
+        if $three; then printf '%-8s %-56s %14s %14s %14s  %s\n' KIND OBJECT "SOURCE(now)" "$rhead" RESTORED STATUS
+        else            printf '%-8s %-56s %14s %14s  %s\n' KIND OBJECT "$rhead" RESTORED STATUS; fi
+        { grep -v '^#SUMMARY' "$rows" || true; } | while IFS=$'\t' read -r kind obj lv rv tv sev st; do
+            if $three; then printf '%-8s %-56s %14s %14s %14s  %s\n' "$kind" "$obj" "$lv" "$rv" "$tv" "$st"
+            else            printf '%-8s %-56s %14s %14s  %s\n' "$kind" "$obj" "$rv" "$tv" "$st"; fi
+        done
+    } >"$report"
+    FP_LAST_REPORT="$report"
+
+    # console: only what needs attention, then the verdict
+    { awk -F'\t' '$6 == "fail" || $6 == "warn"' "$rows" || true; } \
+        | while IFS=$'\t' read -r kind obj lv rv tv sev st; do
+            if [[ $sev == fail ]]; then err "$kind $obj: $st (reference ${rv}, restored ${tv})"
+            else warn "$kind $obj: $st (reference ${rv}, restored ${tv})"; fi
+        done
+    local extra=""
+    (( ${nck:-0} > 0 )) && extra+=" (${nck} with content checksums)"
+    (( ${nwarn:-0} > 0 )) && extra+=", ${nwarn} warning(s)"
+    if (( ${nfail:-0} > 0 )); then
+        err "data verification FAILED: ${nfail} difference(s) between ${rhead} and ${tlabel} — report: $report"
+        [[ -n $ref && -s $ref ]] || warn "no dump fingerprint was compared: differences may be writes made to the source after the backup"
+        rc=1
+    else
+        ok "data verified: ${ntab:-0} tables, ${trows:-0} rows match ${rhead}, ${nseq:-0} sequences checked${extra} — report: $report"
+    fi
+    return $rc
+}
+
+load_target_entry() {  # <name>  -> DST_* from targets:, falling back to databases:
+    if cfgpy names "$CONFIG" targets 2>/dev/null | grep -qx "$1"; then load_entry targets "$1" DST_
+    else load_entry databases "$1" DST_; fi
+}
+
+is_plain_source() {  # <name>  -> configured source that is one database (not a whole server)
+    cfgpy names "$CONFIG" databases 2>/dev/null | grep -qx "$1" || return 1
+    ! entry_is_all_databases "$1"
+}
+
+# verify_data <counts|full> <dump|""> <source|""> <source-db|""> <target> <target-db|"">
+verify_data() {
+    local mode="$1" dump="$2" src="$3" sdb="$4" tgt="$5" tdb="$6"
+    local ref="" live="" restored="$RUNDIR/fp.restored.tsv" rlabel="DUMP"
+    if [[ -n $dump ]]; then
+        if [[ -s "${dump}.fingerprint.tsv" ]]; then
+            ref="${dump}.fingerprint.tsv"
+            log "reference: dump fingerprint ($(sed -n '1s/^# dbtool fingerprint v1 *//p' "$ref"))"
+            [[ $mode == full ]] && grep -q 'mode=counts' "$ref" && warn "the dump's fingerprint has row counts only — checksums cannot be compared against it"
+        else
+            log "reference: no fingerprint for $(basename "$dump") — counting rows in the dump's data (no checksums)"
+            CTX_ENGINE=postgres; CTX_PASS=""; CTX_SSLMODE=""
+            pick_pg_client_for_dump "$dump"
+            ref="$RUNDIR/fp.dump.tsv"
+            dump_row_counts "$dump" "$ref" || die "could not read row counts from $(basename "$dump")"
+            DOCKER_EXTRA=()
+        fi
+    fi
+
+    load_target_entry "$tgt"; use_ctx DST_
+    [[ -n $tdb ]] && CTX_DB="$tdb"
+    [[ $CTX_ENGINE == postgres ]] || die "data verification supports PostgreSQL only"
+    local tlabel="${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
+    resolve_client
+    log "fingerprinting restored ${tlabel} (${mode})"
+    fingerprint_ctx "$mode" "$restored" || return 1
+
+    if [[ -n $src ]]; then
+        load_entry databases "$src" SRC_; use_ctx SRC_
+        [[ -n $sdb ]] && CTX_DB="$sdb"
+        resolve_client
+        log "fingerprinting live source ${CTX_HOST}:${CTX_PORT}/${CTX_DB} (${mode}, read-only)"
+        fingerprint_ctx "$mode" "$RUNDIR/fp.live.tsv" && live="$RUNDIR/fp.live.tsv"
+    fi
+    [[ -n $ref || -n $live ]] || die "nothing to compare the restored database with (give a source or a dump)"
+    compare_fingerprints "$ref" "$restored" "$live" "$rlabel" "$tlabel"
+}
+
+norm_verify_mode() {  # <value> -> counts | full | ""
+    case "${1,,}" in
+        full) echo full ;; counts|count|true|yes|on|1) echo counts ;; *) echo "" ;;
+    esac
+}
+
+pg_analyze_ctx() {  # refresh planner statistics after a load — pg_dump does not carry them
+    log "analyzing ${CTX_DB} (planner statistics are not part of a dump)"
+    pg_run psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$CTX_DB" --no-password -qX \
+        -v ON_ERROR_STOP=1 -c 'ANALYZE;' >/dev/null || warn "ANALYZE failed on ${CTX_DB}; run it by hand"
+}
+
+cmd_compare() {
+    local -a pos=(); local dump="" latest="" mode=counts sdb="" tdb=""
+    while (( $# )); do
+        case "$1" in
+            --dump)        dump="$2"; shift 2 ;;
+            --latest)      latest="$2"; shift 2 ;;
+            --full)        mode=full; shift ;;
+            --database)    sdb="$2"; shift 2 ;;
+            --target-db)   tdb="$2"; shift 2 ;;
+            -*) die "compare: unknown option $1" ;;
+            *)  pos+=("$1"); shift ;;
+        esac
+    done
+    local src="" tgt=""
+    case ${#pos[@]} in
+        1) tgt="${pos[0]}" ;;
+        2) src="${pos[0]}"; tgt="${pos[1]}" ;;
+        *) die "usage: $SCRIPT_NAME compare [SOURCE] TARGET [--dump FILE | --latest NAME] [--full]" ;;
+    esac
+    if [[ -n $latest ]]; then
+        dump="$(latest_backup_for "$latest")"; [[ -n $dump ]] || die "no backups found for '$latest'"
+        [[ -z $src ]] && is_plain_source "$latest" && src="$latest"
+    fi
+    [[ -z $dump || -f $dump ]] || die "dump not found: $dump"
+    [[ -n $src || -n $dump ]] || die "compare needs a source, a dump (--dump/--latest), or both"
+    [[ -n $dump ]] && log "dump: $(basename "$dump")"
+    $DRY_RUN && { log "would fingerprint ${tgt}${src:+ and $src}${dump:+ and compare with $(basename "$dump")}"; return 0; }
+    verify_data "$mode" "$dump" "$src" "$sdb" "$tgt" "$tdb"
+}
+
+# A restore drill: restore the newest backup into a scratch target, verify the
+# data, record how old the backup was (RPO) and how long recovery took (RTO),
+# then drop the scratch database. Untested backups are not backups.
+cmd_drill() {
+    local name="" tgt="" mode=counts keep=false sp=""
+    while (( $# )); do
+        case "$1" in
+            -t|--to)       tgt="$2"; shift 2 ;;
+            --full)        mode=full; shift ;;
+            --keep)        keep=true; shift ;;
+            --search-path) sp="$2"; shift 2 ;;
+            -*) die "drill: unknown option $1" ;;
+            *)  name="$1"; shift ;;
+        esac
+    done
+    [[ -n $name && -n $tgt ]] || die "usage: $SCRIPT_NAME drill NAME -t SCRATCH_TARGET [--full] [--keep] [--search-path S]"
+    cfgpy names "$CONFIG" targets 2>/dev/null | grep -qx "$tgt" \
+        || die "drill target '$tgt' must be in targets: (a drill drops its database afterwards; never point it at a source)"
+    # the name check above is not enough: a target can point at the very database a source backs up
+    load_target_entry "$tgt"; use_ctx DST_
+    local want="${CTX_HOST}:${CTX_PORT}/${CTX_DB}" sn
+    while IFS= read -r sn; do
+        [[ -n $sn ]] || continue
+        load_entry databases "$sn" SRC_
+        [[ "$(gv SRC_HOST):$(gv SRC_PORT)/$(gv SRC_DB)" != "$want" ]] \
+            || die "drill target '$tgt' ($want) is the database source '$sn' backs up; a drill drops its target afterwards"
+    done < <(cfgpy names "$CONFIG" databases)
+    local file; file="$(latest_backup_for "$name")"; [[ -n $file ]] || die "no backups found for '$name'"
+    local age_s=$(( $(date +%s) - $(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file") ))
+    log "drill: $(basename "$file") (age $((age_s / 3600))h$(( (age_s % 3600) / 60 ))m) -> target '$tgt'"
+    local t0=$SECONDS
+    local -a ra=(--latest "$name" -t "$tgt" --drop --verify-data "$mode")
+    [[ -n $sp ]] && ra+=(--search-path "$sp")
+    cmd_restore "${ra[@]}"
+    local took=$((SECONDS - t0))
+    $DRY_RUN && return 0
+    if ! $keep; then
+        load_target_entry "$tgt"; use_ctx DST_; resolve_client
+        log "drill: dropping scratch database ${CTX_DB}"
+        pg_run psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "${CFG_MAINTENANCE_DB:-postgres}" --no-password -qtAX \
+            -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"${CTX_DB}\";" >/dev/null || warn "could not drop ${CTX_DB}"
+    fi
+    ok "DRILL PASSED: $(basename "$file") — backup age $((age_s / 60)) min (RPO), restore + verify ${took}s (RTO)${FP_LAST_REPORT:+ — report: $FP_LAST_REPORT}"
+    _write_log "DRILL name=$name target=$tgt file=$(basename "$file") age_s=$age_s rto_s=$took mode=$mode result=pass"
 }
 
 # ===========================================================================
@@ -1215,7 +1628,7 @@ pg_prepare_target() {  # <create> <drop>
     [[ -z ${CTX_SEARCH_PATH:-} || $CTX_SEARCH_PATH =~ ^[A-Za-z0-9_\$\ ,\"]+$ ]] \
         || die "search_path has unexpected characters: $CTX_SEARCH_PATH"
     if [[ $drop == true ]]; then
-        confirm "DROP DATABASE ${CTX_DB} on ${CTX_HOST}:${CTX_PORT}?" || die "aborted by user"
+        ${DROP_CONFIRMED:-false} || confirm "DROP DATABASE ${CTX_DB} on ${CTX_HOST}:${CTX_PORT}?" || die "aborted by user"
         log "dropping database $CTX_DB"
         $DRY_RUN || pg_run psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d postgres -v ON_ERROR_STOP=1 -qtAX \
             -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${CTX_DB}' AND pid<>pg_backend_pid();" \
@@ -1316,7 +1729,8 @@ restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
 
     if [[ -f "${file}.sha256" ]] && have sha256sum; then
         ( cd "$fdir" && sha256sum -c --status "$(basename "$file").sha256" ) \
-            && log "checksum OK" || warn "checksum MISMATCH for $(basename "$file")"
+            || die "checksum MISMATCH for $(basename "$file") — the file changed since it was written; refusing to restore it"
+        log "checksum OK"
     fi
 
     resolve_client
@@ -1341,6 +1755,7 @@ restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
                 log "restoring plain SQL into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
                 decompress_stream "$file" | pg_run psql "${rargs[@]}" -v ON_ERROR_STOP=1 --quiet -f - ;;
         esac
+        ${NO_ANALYZE:-false} || $DRY_RUN || pg_analyze_ctx
     else
         my_prepare_target "$create" "$drop"
         log "restoring SQL into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
@@ -1350,7 +1765,7 @@ restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
 }
 
 cmd_restore() {
-    local file="" src_name="" tgt="" tgt_db="" create=false drop=false use_latest=false search_path=""
+    local file="" src_name="" tgt="" tgt_db="" create=false drop=false use_latest=false search_path="" verify="" no_verify=false
     while (( $# )); do
         case "$1" in
             -f|--file)     file="$2"; shift 2 ;;
@@ -1360,6 +1775,10 @@ cmd_restore() {
             --create)      create=true; shift ;;
             --drop)        drop=true; shift ;;
             --search-path) search_path="$2"; shift 2 ;;
+            --verify-data) verify=counts
+                           if [[ ${2:-} == counts || ${2:-} == full ]]; then verify="$2"; shift; fi; shift ;;
+            --no-verify-data) no_verify=true; shift ;;
+            --no-analyze)  NO_ANALYZE=true; shift ;;
             *) die "restore: unknown option $1" ;;
         esac
     done
@@ -1367,24 +1786,31 @@ cmd_restore() {
     [[ -n $file ]] || die "restore needs -f <file> or --latest <name>"
     [[ -n $tgt  ]] || die "restore needs -t <target-or-database-name>"
 
-    if cfgpy names "$CONFIG" targets 2>/dev/null | grep -qx "$tgt"; then
-        load_entry targets "$tgt" DST_
-    else
-        load_entry databases "$tgt" DST_   # restore back onto a configured source
-    fi
+    load_target_entry "$tgt"   # targets:, or a configured source to restore back onto
     use_ctx DST_
     [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
     [[ -n $search_path ]] && CTX_SEARCH_PATH="$search_path"
     [[ $CTX_CREATE_DB == true ]] && create=true
+    [[ -n $verify ]] || verify="$(norm_verify_mode "${CTX_VERIFY_DATA:-}")"
+    $no_verify && verify=""
+    [[ -n $verify && $CTX_ENGINE != postgres ]] && { warn "--verify-data supports PostgreSQL only; skipped"; verify=""; }
     confirm "Restore $(basename "$file") into ${CTX_ENGINE} ${CTX_HOST}:${CTX_PORT}/${CTX_DB}?" || die "aborted by user"
+    local tdesc="${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
     restore_into_ctx "$file" "$create" "$drop"
+
+    if [[ -n $verify ]] && ! $DRY_RUN; then
+        local vsrc=""
+        $use_latest && is_plain_source "$src_name" && vsrc="$src_name"
+        verify_data "$verify" "$file" "$vsrc" "" "$tgt" "$tgt_db" \
+            || die "restored data does not match the dump — do not use ${tdesc} until this is explained"
+    fi
 }
 
 # ===========================================================================
 #  MIGRATE  (server -> server, streaming by default)
 # ===========================================================================
 cmd_migrate() {
-    local from="" to="" tgt_db="" create=false drop=false via_file=false search_path=""
+    local from="" to="" tgt_db="" create=false drop=false via_file=false search_path="" verify="" no_verify=false
     while (( $# )); do
         case "$1" in
             -s|--from)     from="$2"; shift 2 ;;
@@ -1394,6 +1820,10 @@ cmd_migrate() {
             --drop)        drop=true; shift ;;
             --via-file)    via_file=true; shift ;;
             --search-path) search_path="$2"; shift 2 ;;
+            --verify-data) verify=counts
+                           if [[ ${2:-} == counts || ${2:-} == full ]]; then verify="$2"; shift; fi; shift ;;
+            --no-verify-data) no_verify=true; shift ;;
+            --no-analyze)  NO_ANALYZE=true; shift ;;
             *) die "migrate: unknown option $1" ;;
         esac
     done
@@ -1413,8 +1843,14 @@ cmd_migrate() {
         [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
         [[ -n $search_path ]] && CTX_SEARCH_PATH="$search_path"
         [[ $CTX_CREATE_DB == true ]] && create=true
+        [[ -n $verify ]] || verify="$(norm_verify_mode "${CTX_VERIFY_DATA:-}")"
+        $no_verify && verify=""
         confirm "Restore $(basename "$f") into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}?" || die "aborted by user"
         restore_into_ctx "$f" "$create" "$drop"
+        if [[ -n $verify && $CTX_ENGINE == postgres ]] && ! $DRY_RUN; then
+            verify_data "$verify" "$f" "$from" "" "$to" "$tgt_db" \
+                || die "migrated data does not match the source snapshot"
+        fi
         return
     fi
 
@@ -1423,6 +1859,12 @@ cmd_migrate() {
     resolve_client
     local S_MODE="$PG_MODE$MY_MODE" S_IMG="$PG_IMAGE$MY_IMAGE"
     local -a S_HOSTARGS=()
+    # verification needs the target's setting, read before the source dump starts
+    local v_cfg; v_cfg="$(gv DST_VERIFY_DATA)"
+    [[ -n $verify ]] || verify="$(norm_verify_mode "$v_cfg")"
+    $no_verify && verify=""
+    [[ $s_engine == postgres ]] || verify=""
+    local src_fp=""
     if [[ $s_engine == postgres ]]; then build_pg_dump_args; else build_my_dump_args; fi
     local -a S_DUMPARGS=("${DUMPARGS[@]}")
     local S_HOST="$CTX_HOST" S_PORT="$CTX_PORT" S_USER="$CTX_USER" S_PASS="$CTX_PASS" \
@@ -1444,6 +1886,28 @@ cmd_migrate() {
 
     local start=$SECONDS
     if [[ $s_engine == postgres ]]; then
+        # Ask everything first, then open the snapshot: held across a human answer it pins the
+        # source's xmin, and idle_in_transaction_session_timeout can expire it after the DROP.
+        if [[ $drop == true ]] && ! $DRY_RUN; then
+            confirm "DROP DATABASE ${CTX_DB} on ${CTX_HOST}:${CTX_PORT}?" || die "aborted by user"
+            DROP_CONFIRMED=true
+        fi
+        if [[ -n $verify ]] && ! $DRY_RUN; then
+            src_fp="$RUNDIR/fp.source.tsv"
+            local T_HOST="$CTX_HOST" T_PORT="$CTX_PORT" T_USER="$CTX_USER" T_PASS="$CTX_PASS" T_DB="$CTX_DB" \
+                  T_SSL="$CTX_SSLMODE" T_MODE="$PG_MODE" T_IMG="$PG_IMAGE" snap_ok=false
+            CTX_HOST="$S_HOST"; CTX_PORT="$S_PORT"; CTX_USER="$S_USER"; CTX_PASS="$S_PASS"; CTX_DB="$S_DB"
+            CTX_SSLMODE="$S_SSL"; PG_MODE="$S_PGMODE"; PG_IMAGE="$S_PGIMG"
+            if pg_snapshot_open && pg_snapshot_run "$(pg_fingerprint_sql "$verify" "${S_VER%%.*}")" "$src_fp"; then
+                S_DUMPARGS+=(--snapshot="$SNAP_ID"); DUMPARGS=("${S_DUMPARGS[@]}")
+                fp_filter_by_dump_args "$src_fp"; snap_ok=true
+            fi
+            local snap_err; snap_err="$(pg_snapshot_err)" || true
+            CTX_HOST="$T_HOST"; CTX_PORT="$T_PORT"; CTX_USER="$T_USER"; CTX_PASS="$T_PASS"; CTX_DB="$T_DB"
+            CTX_SSLMODE="$T_SSL"; PG_MODE="$T_MODE"; PG_IMAGE="$T_IMG"
+            $snap_ok || die "could not fingerprint the source for --verify-data: $snap_err"
+            log "source fingerprint ($verify) taken in snapshot $SNAP_ID; pg_dump will use the same snapshot"
+        fi
         pg_prepare_target "$create" "$drop"
         if $DRY_RUN; then
             log "would run: pg_dump [source] -Fc -Z0 | pg_restore [target]"; return 0
@@ -1453,6 +1917,8 @@ cmd_migrate() {
           CTX_SSLMODE="$S_SSL"; PG_MODE="$S_PGMODE"; PG_IMAGE="$S_PGIMG"
           pg_run pg_dump "${S_DUMPARGS[@]}" -Fc -Z 0
         ) | pg_restore_archive ""
+        pg_snapshot_close
+        ${NO_ANALYZE:-false} || pg_analyze_ctx
     else
         my_prepare_target "$create" "$drop"
         if $DRY_RUN; then log "would run: mysqldump [source] | mysql [target]"; return 0; fi
@@ -1469,6 +1935,12 @@ cmd_migrate() {
     if [[ $s_engine == postgres ]]; then
         local cnt; cnt="$(_pg_query "$CTX_DB" "SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')")"
         log "target now has ${cnt:-?} tables"
+        if [[ -n $src_fp ]]; then
+            log "fingerprinting target ${CTX_HOST}:${CTX_PORT}/${CTX_DB} ($verify)"
+            fingerprint_ctx "$verify" "$RUNDIR/fp.restored.tsv" || die "could not fingerprint the target"
+            compare_fingerprints "$src_fp" "$RUNDIR/fp.restored.tsv" "" "SOURCE@SNAPSHOT" "${CTX_HOST}:${CTX_PORT}/${CTX_DB}" \
+                || die "migrated data does not match the source snapshot"
+        fi
     else
         local cnt; cnt="$(_my_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${CTX_DB}'")"
         log "target now has ${cnt:-?} tables"
@@ -1501,7 +1973,7 @@ cmd_list() {
         [[ -z $f ]] && continue
         size="$(stat -c %s "$f" 2>/dev/null || stat -f %z "$f")"
         printf '  %-58s %10s  %s\n' "$(basename "$f")" "$(human "$size")" "$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || true)"
-    done < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f ! -name '*.sha256' ! -name '*.meta.json' \
+    done < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f ! -name '*.sha256' ! -name '*.meta.json' ! -name '*.fingerprint.tsv' \
              ! -name '*.log' ! -name '*.part' -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}')
     printf '\n'
 }
@@ -1900,8 +2372,15 @@ COMMANDS
   backup [name|all]              Dump one, several (comma-separated) or all databases
   restore -f FILE -t TARGET      Restore a dump into a target (or --latest NAME)
           [--database DB] [--create] [--drop] [--search-path auto|SCHEMAS]
+          [--verify-data [counts|full]] [--no-analyze]
   migrate --from SRC --to TGT    Stream a database to another server
           [--target-db DB] [--create] [--drop] [--via-file] [--search-path auto|SCHEMAS]
+          [--verify-data [counts|full]] [--no-analyze]
+  compare [SOURCE] TARGET        Check restored data against the dump and/or the live source:
+          [--dump FILE | --latest NAME] [--full]   row counts (+ content checksums with --full),
+          [--database DB] [--target-db DB]         sequences, object counts; exit 1 on mismatch
+  drill NAME -t SCRATCH_TARGET   Restore drill: restore newest backup, verify it, report
+          [--full] [--keep]      backup age (RPO) and restore time (RTO), drop the scratch DB
   globals                        Dump cluster roles/grants for every postgres server
   discover [name|all]            List every database on the configured servers and
            [--url DSN]           show which ones the config does not cover
@@ -1977,6 +2456,8 @@ main() {
         verify)  cmd_verify ${rest[@]+"${rest[@]}"} ;;
         test)    cmd_test ${rest[@]+"${rest[@]}"} ;;
         discover) cmd_discover ${rest[@]+"${rest[@]}"} ;;
+        compare) cmd_compare ${rest[@]+"${rest[@]}"} ;;
+        drill)   cmd_drill ${rest[@]+"${rest[@]}"} ;;
         *) die "unknown command: $cmd (see -h)" ;;
     esac
 }

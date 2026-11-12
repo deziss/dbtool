@@ -16,6 +16,7 @@
     "timestamp_format": "%Y%m%d-%H%M%S",
     "maintenance_db": "postgres",
     "verify": "full",
+    "fingerprint": "counts",
     "include_globals": true,
     "lock": true
   },
@@ -101,7 +102,8 @@
       "create": true,
       "clean": false,
       "restore_args": ["--no-owner", "--no-privileges"],
-      "search_path": ""
+      "search_path": "",
+      "verify_data": "counts"
     },
     "new_server_pg": {
       "engine": "postgres",

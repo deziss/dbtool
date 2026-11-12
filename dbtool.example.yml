@@ -25,6 +25,7 @@ defaults:
   timestamp_format: "%Y%m%d-%H%M%S"
   maintenance_db: postgres          # database used to enumerate / create / drop
   verify: full                      # full | header | none — full reads the whole archive back
+  fingerprint: counts              # counts | full | none — data fingerprint in the dump's snapshot
   include_globals: true             # 'backup all' also dumps cluster roles/grants per server
   lock: true                        # refuse to run while another dbtool holds the backup_dir
 
@@ -116,6 +117,7 @@ targets:
     clean: false                    # pg_restore --clean --if-exists
     restore_args: ["--no-owner", "--no-privileges"]
     # search_path: auto            # for schemas whose functions call others unqualified (auto | app,public)
+    verify_data: counts             # check data after every restore into this target: counts | full
 
   new_server_pg:
     engine: postgres

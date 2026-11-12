@@ -9,6 +9,7 @@ they're new enough, otherwise a throwaway `postgres:<major>` / `mysql:<major.min
 `mariadb:<major.minor>` container. Nothing is installed permanently.
 Which PostgreSQL versions work for what: [POSTGRES_SUPPORT.md](POSTGRES_SUPPORT.md).
 Something failing: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+Operating procedure for backups, restores, migrations and restore drills: [SOP.md](SOP.md).
 
 > **Your real config never belongs in git.** Copy an example, fill it in, and keep it at
 > `/etc/dbtool/dbtool.yml`. `.gitignore` already blocks `dbtool.yml`/`dbtool.env`/dumps —
@@ -103,7 +104,8 @@ Aliases are accepted where obvious (`username`/`uname`, `pass`/`passwd`, `db`/`d
 `defaults` controls `backup_dir`, `log_file`, `retention_days`, `retention_min_keep`,
 `compression` (`zstd|gzip|none`), `pg_compress_level`, `format` (`custom|plain|directory`),
 `jobs`, `docker` (`auto|always|never`), `docker_network`, `timeout`, `timestamp_format`,
-`verify` (`full|header|none`), `include_globals`, `lock` and `maintenance_db`.
+`verify` (`full|header|none`), `fingerprint` (`counts|full|none`), `include_globals`, `lock` and
+`maintenance_db`.
 
 `databases:` are backup sources; `targets:` are restore/migration destinations. The JSON file
 is byte-for-byte the same structure — use whichever you prefer.
@@ -135,6 +137,7 @@ targets:
 | `create` | Create the database if missing (same as `--create`). |
 | `clean` | PostgreSQL: drop and recreate each object before restoring it. `--drop` instead drops the whole database first, after a prompt. |
 | `search_path` | PostgreSQL: `search_path` the restore runs with; `--search-path` overrides it per run. |
+| `verify_data` | PostgreSQL: `counts` or `full` — check the data after every restore/migrate into this target (`--verify-data` / `--no-verify-data` per run). |
 | `restore_args` | Extra arguments passed to `pg_restore`. |
 | `jobs` | Parallel `pg_restore` workers (not used with `search_path`). |
 | `image` | Pin the client container image. |
@@ -155,6 +158,8 @@ dbtool backup app_dev,crm_mysql               # a subset
 dbtool globals                                # roles/grants only, one file per server
 dbtool list                                   # sources, targets, local dumps
 dbtool verify /backup/db/app_dev_*.dump       # checksum + full dump read
+dbtool compare app_dev staging_pg --latest app_dev --full   # restored data vs dump vs live source
+dbtool drill app_dev -t drill_scratch -y      # restore drill: restore, verify, RPO/RTO, drop
 dbtool prune                                  # apply retention now
 ```
 
@@ -269,6 +274,37 @@ dbtool restore --latest app_dev -t staging_pg --drop --search-path app,public   
 `--search-path` is for schemas whose SQL functions call other functions without a schema
 prefix; such restores otherwise fail with `function … does not exist … during inlining`.
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#restore-fails-function-does-not-exist-during-inlining).
+
+## Verify restored data
+
+A restore that finishes without errors can still be incomplete. dbtool checks the data itself.
+
+- **At backup** it records `<dump>.fingerprint.tsv`, with per-table row counts, sequence values
+  and object counts. With `fingerprint: full` it also records an order-independent checksum of
+  every row. It takes these in **the same snapshot pg_dump uses**, so they describe exactly what
+  is in the dump, even on a busy source.
+- **After restore or migrate**, `--verify-data [counts|full]` (or `verify_data:` on the
+  target) fingerprints the restored database and compares it. The command exits with status 1
+  if any table, sequence or object differs.
+- **At any time**, `dbtool compare` runs the same check.
+
+```bash
+dbtool restore --latest app_dev -t staging_pg --drop --verify-data full
+dbtool compare staging_pg --latest app_dev --full             # restored vs dump (+ live source)
+dbtool compare app_dev staging_pg --full                      # two live databases
+dbtool migrate --from app_prod --to new_pg --drop --verify-data full -y   # exact, even while the source takes writes
+```
+
+| Reference | Exact? | When |
+|---|---|---|
+| Dump fingerprint (`.fingerprint.tsv`) | yes, taken in the dump's snapshot | dumps made by 1.3.0+ |
+| Dump data (COPY rows counted from the file) | row counts only | older dumps without a fingerprint |
+| Live source | no: shows the drift since the backup, reported as information | `--latest NAME` of a configured source, or `compare SOURCE TARGET` |
+
+`--verify-data` also runs `ANALYZE` after the load. `--no-analyze` skips that, and the
+analyze step runs on every PostgreSQL restore anyway. Each check writes a full report to
+`<backup_dir>/reports/`. `dbtool drill NAME -t SCRATCH` combines restore, verify and drop, and
+reports the backup's age (RPO) and how long the recovery took (RTO). See [SOP.md](SOP.md).
 
 ## Migrate to another server
 
