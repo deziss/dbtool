@@ -23,7 +23,7 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.2.2"
+readonly DBTOOL_VERSION="1.2.3"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
@@ -1252,11 +1252,27 @@ my_prepare_target() {  # <create> <drop>
 # "function … does not exist … during inlining". The dump is fine; the schema
 # relies on search_path. --search-path / search_path: restores single-stream
 # with that one statement rewritten, leaving every object untouched.
-_pg_restore_hint() {  # <stderr file>
-    grep -q 'during inlining\|function .* does not exist' "$1" 2>/dev/null || return 0
-    warn "a function in this schema calls another without a schema prefix, and pg_restore"
-    warn "runs with an empty search_path. Retry with --search-path public (or set"
-    warn "search_path: public on the target), and fix the schema: ALTER FUNCTION … SET search_path = public"
+_pg_function_schemas() {  # [archive args...] -> comma list of schemas that own functions in the dump
+    (( $# )) || return 0
+    pg_run pg_restore -l "$@" 2>/dev/null | awk '$4 == "FUNCTION" { s = $5; if (s !~ /^[a-z_][a-z0-9_$]*$/) { gsub(/"/, "\"\"", s); s = "\"" s "\"" } print s }' | sort -u | paste -sd, -
+}
+
+_pg_restore_hint() {  # <stderr file> [archive args...]
+    local errf="$1"; shift
+    grep -q 'during inlining\|function .* does not exist' "$errf" 2>/dev/null || return 0
+    local schemas; schemas="$(_pg_function_schemas "$@" || true)"
+    if [[ -n ${CTX_SEARCH_PATH:-} ]]; then
+        warn "search_path '${CTX_SEARCH_PATH}' does not contain the schema of the missing function."
+    else
+        warn "a SQL function calls another without a schema prefix, and pg_restore runs with an empty search_path."
+    fi
+    if (( $# )); then
+        warn "Functions in this dump live in: ${schemas:-unknown}. Retry with --search-path auto"
+        warn "(or --search-path <schema>,public). Lasting fix: ALTER FUNCTION … SET search_path = <schema>"
+    else
+        warn "A streaming migrate cannot list the dump's schemas. Retry with: migrate --via-file --search-path auto"
+        warn "(or name the schema: --search-path <schema>,public). Lasting fix: ALTER FUNCTION … SET search_path = <schema>"
+    fi
 }
 
 pg_restore_archive() {  # <jobs> [archive args...]   (no archive args = read stdin)
@@ -1268,9 +1284,15 @@ pg_restore_archive() {  # <jobs> [archive args...]   (no archive args = read std
     opts+=(${CTX_RESTORE_ARGS[@]+"${CTX_RESTORE_ARGS[@]}"})
     : >"$errf"
     if [[ -n ${CTX_SEARCH_PATH:-} ]]; then
-        log "restoring single-stream with search_path=${CTX_SEARCH_PATH} (parallel jobs not used)"
+        local sp="$CTX_SEARCH_PATH"
+        if [[ $sp == auto ]]; then
+            (( $# )) || die "--search-path auto reads the schemas from a dump file; use --via-file, or name them (--search-path app,public)"
+            sp="$(_pg_function_schemas "$@" || true)"
+            [[ ,$sp, == *,public,* ]] || sp="${sp:+$sp,}public"
+        fi
+        log "restoring single-stream with search_path=${sp} (parallel jobs not used)"
         pg_run pg_restore "${opts[@]}" -f - "$@" \
-            | awk -v sp="$CTX_SEARCH_PATH" -v q="'" -v dry="$DRY_RUN" '
+            | awk -v sp="$sp" -v q="'" -v dry="$DRY_RUN" '
                 BEGIN { from = "SELECT pg_catalog.set_config(" q "search_path" q ", " q q ", false);"
                         to   = "SELECT pg_catalog.set_config(" q "search_path" q ", " q sp q ", false);" }
                 !done && $0 == from { print to; done = 1; next }
@@ -1283,7 +1305,7 @@ pg_restore_archive() {  # <jobs> [archive args...]   (no archive args = read std
             2> >(tee "$errf" >&2) || rc=$?
     fi
     wait 2>/dev/null || true   # let tee flush before reading the file
-    (( rc == 0 )) || { _pg_restore_hint "$errf"; die "pg_restore failed (exit $rc)"; }
+    (( rc == 0 )) || { _pg_restore_hint "$errf" "$@"; die "pg_restore failed (exit $rc)"; }
 }
 
 restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
@@ -1412,6 +1434,8 @@ cmd_migrate() {
     use_ctx DST_
     [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
     [[ -n $search_path ]] && CTX_SEARCH_PATH="$search_path"
+    [[ ${CTX_SEARCH_PATH:-} == auto ]] \
+        && die "search_path auto reads the schemas from a dump file, and a streaming migrate has none; use --via-file, or name them (--search-path app,public)"
     [[ $CTX_CREATE_DB == true ]] && create=true
     resolve_client
 
@@ -1875,9 +1899,9 @@ USAGE
 COMMANDS
   backup [name|all]              Dump one, several (comma-separated) or all databases
   restore -f FILE -t TARGET      Restore a dump into a target (or --latest NAME)
-          [--database DB] [--create] [--drop] [--search-path public]
+          [--database DB] [--create] [--drop] [--search-path auto|SCHEMAS]
   migrate --from SRC --to TGT    Stream a database to another server
-          [--target-db DB] [--create] [--drop] [--via-file] [--search-path public]
+          [--target-db DB] [--create] [--drop] [--via-file] [--search-path auto|SCHEMAS]
   globals                        Dump cluster roles/grants for every postgres server
   discover [name|all]            List every database on the configured servers and
            [--url DSN]           show which ones the config does not cover

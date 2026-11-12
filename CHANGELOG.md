@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.3
+
+- `--search-path auto` builds the search_path from the schemas that own functions in
+  the dump, plus `public`. Apps that migrate into their own schema (a DSN with
+  `options=-c search_path=app`) failed with `--search-path public`, because the
+  functions are not in `public`.
+- The failure hint now lists the schemas that own functions in the dump, and says
+  when a given search_path missed them.
+- Mixed-case schema names are quoted in the `auto` search_path.
+- A streaming `migrate` refuses `search_path: auto` before `--drop` touches the target
+  (it has no dump file to read schemas from; use `--via-file` or name them).
+- Docs: troubleshooting moved to `TROUBLESHOOTING.md`, with a full write-up of the
+  "does not exist … during inlining" restore failure; README documents `targets:`
+  and no longer carries the file tree.
+
 ## 1.2.2
 
 - `restore` / `migrate --search-path public` (or `search_path:` on a target) restore a
