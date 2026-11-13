@@ -1,5 +1,57 @@
 # Changelog
 
+## 1.4.0
+
+- `dbtool compare … --sample SCHEMA.TABLE [--rows N]` picks random rows from the restored
+  database by primary key (or a NOT NULL unique key, or `--key`). It reads the same rows from
+  the dump and the live source and prints each column side by side, marking differences.
+  Dump rows are loaded into a `TEMP` table on the target, so values print identically
+  whatever the time zone or settings of the session that made the dump. The command exits 1
+  if a row differs from the dump (or from the source when no dump is given), and writes a
+  report to `<backup_dir>/reports/sample_*.txt`. `--where` narrows which rows can be picked;
+  `--width` sets the column width.
+- **Retention:**
+  - Grandfather-father-son rules `keep_daily`, `keep_weekly`, `keep_monthly` and
+    `keep_yearly` keep the newest dump of each of the last N periods once it is past
+    `retention_days`.
+  - `retention_max_size` caps the total size of all dumps, pruning the oldest first and never
+    going below `retention_min_keep`.
+  - `min_free_space` makes a backup prune first, then refuse to start rather than fill the
+    disk.
+  - `prune` reports the space freed, and `-n prune` says why each file would go.
+- **Docker clients under systemd `PrivateTmp=true` (the shipped timer unit):**
+  - MySQL-via-docker used to bind-mount its option file from dbtool's temp dir under `/tmp`.
+    dockerd cannot see that directory and mounted an empty one, so timer backups ran without
+    credentials. The option file now reaches the container through an environment variable.
+  - Directory-format restore, `compare` and `--sample` extract into
+    `<backup_dir>/.staging/` instead of `/tmp`, for the same reason.
+  - The next backup removes staging directories more than a day old, including the copies
+    earlier versions left behind.
+- **Credentials no longer appear in `ps`.** `PGPASSWORD` was passed as `env PGPASSWORD=…` and
+  `docker run -e PGPASSWORD=…`; it now goes through the environment only.
+- Each MySQL client call gets its own option file. A streaming MySQL migrate shared one file
+  between source and target, so either side could connect with the other's login.
+- `test --deep` checked only the first entry when the client ran in docker: `docker run -i`
+  consumed the loop's input. Fixed.
+- MySQL `discover` listed one database named `0` (`||` is OR in MySQL). Fixed.
+- A MySQL password containing a backslash failed through the option file. It is now escaped.
+- A relative `backup_dir` is resolved to an absolute path, which Docker bind mounts need.
+- `s3.keep_remote: false` now works: pruning also deletes the off-box copy and its sidecars.
+  Previously the key was documented but ignored.
+- **Smaller dumps:**
+  - `exclude_table_data` (per entry, PostgreSQL) keeps a table's definition but drops its
+    rows. The fingerprint records those tables as empty, so verification still passes.
+  - `pg_compression: zstd|lz4|gzip|none` selects pg_dump's own compression for custom and
+    directory dumps (zstd and lz4 need PostgreSQL 16+; otherwise dbtool falls back to gzip).
+  - `compression_level` and `zstd_long` tune the compression of plain, directory and MySQL
+    dumps.
+- Directory-format backups no longer leave an uncompressed copy under
+  `<backup_dir>/.staging/` (it was never removed; delete any old `*.dir` folders there).
+- A streaming `migrate --verify-data` from an entry with `exclude_table_data` now expects those
+  tables empty on the target, as `backup` and `restore` already did.
+- Whole-number settings such as `keep_weekly: 08` no longer break bash arithmetic, and sizes
+  like `5.5.5M` are rejected.
+
 ## 1.3.0
 
 - **Data verification.** Backups write `<dump>.fingerprint.tsv`, containing per-table row

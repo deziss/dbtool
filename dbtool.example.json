@@ -6,7 +6,12 @@
     "log_file": "/var/log/dbtool.log",
     "retention_days": 14,
     "retention_min_keep": 3,
+    "keep_daily": 7,
+    "keep_weekly": 4,
+    "keep_monthly": 6,
+    "keep_yearly": 0,
     "compression": "zstd",
+    "pg_compression": "gzip",
     "pg_compress_level": 6,
     "format": "custom",
     "jobs": 4,
@@ -60,6 +65,7 @@
       "format": "custom",
       "no_owner": true,
       "exclude_tables": ["audit_log", "celery_taskmeta"],
+      "exclude_table_data": ["django_session", "*_log"],
       "dump_args": ["--no-privileges"]
     },
     {

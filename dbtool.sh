@@ -23,7 +23,7 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.3.0"
+readonly DBTOOL_VERSION="1.4.0"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
@@ -339,7 +339,8 @@ def build_entry(entry):
     for key, name in (('exclude_tables', 'EXCLUDE'), ('include_tables', 'INCLUDE'),
                       ('exclude_schemas', 'EXCLUDE_SCHEMA'), ('schemas', 'SCHEMA'),
                       ('dump_args', 'DUMP_ARGS'), ('restore_args', 'RESTORE_ARGS'),
-                      ('exclude_databases', 'EXCLUDE_DB'), ('include_databases', 'INCLUDE_DB')):
+                      ('exclude_databases', 'EXCLUDE_DB'), ('include_databases', 'INCLUDE_DB'),
+                      ('exclude_table_data', 'EXCLUDE_DATA')):
         v = entry.get(key) or []
         if isinstance(v, str):
             v = [v]
@@ -418,6 +419,15 @@ CFG_RETENTION_DAYS=14
 CFG_RETENTION_MIN_KEEP=3
 CFG_COMPRESSION="zstd"
 CFG_PG_COMPRESS_LEVEL=6
+CFG_PG_COMPRESSION="gzip"         # gzip | zstd | lz4 | none — pg_dump's own compression (custom/directory)
+CFG_COMPRESSION_LEVEL=""          # zstd 1-19 (20-22 = --ultra), gzip 1-9; empty = zstd 3 / gzip 6
+CFG_ZSTD_LONG=false               # zstd --long=27: finds repeats up to 128 MB apart (plain/directory/mysql)
+CFG_KEEP_DAILY=0                  # GFS retention: newest backup of each of the last N days ...
+CFG_KEEP_WEEKLY=0                 # ... ISO weeks
+CFG_KEEP_MONTHLY=0                # ... months
+CFG_KEEP_YEARLY=0                 # ... years
+CFG_RETENTION_MAX_SIZE=""         # e.g. 200G: prune oldest dumps until backup_dir's dumps fit
+CFG_MIN_FREE_SPACE=""             # e.g. 20G: before a dump, prune if less is free; refuse if still short
 CFG_FORMAT="custom"
 CFG_JOBS=4
 CFG_DOCKER="auto"
@@ -508,6 +518,8 @@ load_config() {
     eval "$(cfgpy notify "$CONFIG" NOTIFY_)"
     S3_ENABLED="$(gv S3_ENABLED)"; S3_PROVIDER="${S3_PROVIDER:-mc}"
     mkdir -p "$CFG_BACKUP_DIR" 2>/dev/null || die "cannot create backup_dir: $CFG_BACKUP_DIR"
+    # absolute: .staging under it is bind-mounted into containers, and docker refuses a relative path
+    CFG_BACKUP_DIR="$(cd "$CFG_BACKUP_DIR" && pwd)" || die "cannot enter backup_dir: $CFG_BACKUP_DIR"
     if [[ -n ${CFG_LOG_FILE:-} ]]; then
         mkdir -p "$(dirname "$CFG_LOG_FILE")" 2>/dev/null || true
         touch "$CFG_LOG_FILE" 2>/dev/null || { warn "cannot write $CFG_LOG_FILE — logging to stdout only"; CFG_LOG_FILE=""; }
@@ -518,6 +530,17 @@ load_config() {
         gzip|none) : ;;
         *) warn "unknown compression '$CFG_COMPRESSION' — using gzip"; CFG_COMPRESSION=gzip ;;
     esac
+    local k v
+    for k in COMPRESSION_LEVEL KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY KEEP_YEARLY RETENTION_DAYS RETENTION_MIN_KEEP PG_COMPRESS_LEVEL; do
+        v="$(gv "CFG_$k")"
+        [[ -z $v || $v =~ ^[0-9]+$ ]] || die "defaults.${k,,} must be a whole number (got '$v')"
+        # a leading zero ('08') is an invalid octal number to bash arithmetic: strip it
+        [[ -z $v ]] || printf -v "CFG_$k" '%s' "$((10#$v))"
+    done
+    for k in RETENTION_MAX_SIZE MIN_FREE_SPACE; do
+        v="$(gv "CFG_$k")"
+        [[ -z $v ]] || (( $(to_bytes "$v") >= 0 )) || die "defaults.${k,,}: '$v' is not a size (use e.g. 500M, 20G, 1T)"
+    done
 }
 
 # A nightly timer and a manual run must not dump or prune the same directory at
@@ -539,7 +562,7 @@ use_ctx() {
              SCHEMA_ONLY DATA_ONLY NO_OWNER CLEAN CREATE_DB IMAGE ALL_DATABASES SEARCH_PATH VERIFY_DATA; do
         eval "CTX_$k=\"\$(gv ${p}${k})\""
     done
-    for k in EXCLUDE INCLUDE EXCLUDE_SCHEMA SCHEMA DUMP_ARGS RESTORE_ARGS EXCLUDE_DB INCLUDE_DB; do
+    for k in EXCLUDE INCLUDE EXCLUDE_SCHEMA SCHEMA DUMP_ARGS RESTORE_ARGS EXCLUDE_DB INCLUDE_DB EXCLUDE_DATA; do
         eval "CTX_$k=(\${${p}${k}[@]+\"\${${p}${k}[@]}\"})"
     done
     [[ -n $CTX_FORMAT ]] || CTX_FORMAT="$CFG_FORMAT"
@@ -586,12 +609,12 @@ _pg_query_raw() {  # _pg_query_raw <dbname> <sql>  -> rows on stdout, via any av
     local db="$1" sql="$2" out="" errf="$RUNDIR/pg.err"
     : >"$errf" 2>/dev/null || true; : >"$PG_ERR_FILE" 2>/dev/null || true
     if have psql; then
-        out="$(env PGPASSWORD="$CTX_PASS" ${CTX_SSLMODE:+PGSSLMODE="$CTX_SSLMODE"} PGCONNECT_TIMEOUT=10 \
+        out="$(_pg_env_exec env PGCONNECT_TIMEOUT=10 \
               psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" -tAX -c "$sql" 2>>"$errf")" || out=""
     fi
     if [[ -z $out ]] && _docker_ok; then
-        out="$(docker run --rm --network "$CFG_DOCKER_NETWORK" \
-              -e PGPASSWORD="$CTX_PASS" ${CTX_SSLMODE:+-e PGSSLMODE="$CTX_SSLMODE"} -e PGCONNECT_TIMEOUT=10 \
+        out="$(_pg_env_exec docker run --rm --network "$CFG_DOCKER_NETWORK" \
+              -e PGPASSWORD ${CTX_SSLMODE:+-e PGSSLMODE} -e PGCONNECT_TIMEOUT=10 \
               "$PG_PROBE_IMAGE" psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" -tAX -c "$sql" 2>>"$errf")" || out=""
     fi
     if [[ -z $out && -s $errf ]]; then
@@ -615,8 +638,8 @@ _my_query_raw() {  # _my_query_raw <sql>
         out="$(mysql --defaults-extra-file="$MY_CNF" --connect-timeout=10 -N -B -e "$1" 2>>"$errf")" || out=""
     fi
     if [[ -z $out ]] && _docker_ok; then
-        out="$(docker run --rm --network "$CFG_DOCKER_NETWORK" -v "$MY_CNF":/tmp/dbtool.cnf:ro \
-              "$MY_PROBE_IMAGE" mysql --defaults-extra-file=/tmp/dbtool.cnf --connect-timeout=10 -N -B -e "$1" 2>>"$errf")" || out=""
+        out="$(DBTOOL_MY_CNF="$(cat "$MY_CNF")" docker run --rm --network "$CFG_DOCKER_NETWORK" -e DBTOOL_MY_CNF \
+              --entrypoint sh "$MY_PROBE_IMAGE" -c "$MY_CNF_SH" sh mysql --defaults-extra-file=/tmp/dbtool.cnf --connect-timeout=10 -N -B -e "$1" 2>>"$errf")" || out=""
     fi
     if [[ -z $out && -s $errf ]]; then
         grep -v '^$' "$errf" | grep -v 'Using a password on the command line' | tr '\t' ' ' \
@@ -716,10 +739,12 @@ resolve_client() {
     esac
 }
 
-write_my_cnf() {
+write_my_cnf() {  # [path]  (default $MY_CNF)
+    local out="${1:-$MY_CNF}"
     umask 077
     { printf '[client]\nhost=%s\nport=%s\nuser=%s\n' "$CTX_HOST" "$CTX_PORT" "$CTX_USER"
-      [[ -n $CTX_PASS ]] && printf 'password="%s"\n' "${CTX_PASS//\"/\\\"}"
+      # inside "..." the option file reads \ as an escape (\t, \n, \\), so escape it first
+      if [[ -n $CTX_PASS ]]; then local pw="${CTX_PASS//\\/\\\\}"; printf 'password="%s"\n' "${pw//\"/\\\"}"; fi
       [[ -n $CTX_CHARSET ]] && printf 'default-character-set=%s\n' "$CTX_CHARSET"
       case "$CTX_SSLMODE" in
         ''|prefer) : ;;
@@ -727,8 +752,35 @@ write_my_cnf() {
         require|REQUIRED) printf 'ssl-mode=REQUIRED\n' ;;
         *) printf 'ssl-mode=%s\n' "${CTX_SSLMODE^^}" ;;
       esac
-    } >"$MY_CNF"
-    chmod 600 "$MY_CNF"
+    } >"$out"
+    chmod 600 "$out"
+}
+
+# Secrets never travel on a command line (ps shows those to every user) and never by
+# bind mount: dbtool's temp dir is under /tmp, which systemd's PrivateTmp=true (and a
+# remote DOCKER_HOST) hides from dockerd — it would silently mount an empty directory.
+# Values go through the environment; `docker run -e NAME` copies them without a value
+# on its own command line.
+_pg_env_exec() {  # <cmd...>  -> runs cmd with PGPASSWORD / PGSSLMODE exported
+    ( export PGPASSWORD="$CTX_PASS"
+      [[ -z $CTX_SSLMODE ]] || export PGSSLMODE="$CTX_SSLMODE"
+      exec "$@" )
+}
+# inside the container: write the option file from the env, drop the env, run the client
+MY_CNF_SH='umask 077; printf "%s\n" "$DBTOOL_MY_CNF" >/tmp/dbtool.cnf; unset DBTOOL_MY_CNF; exec "$@"'
+
+# A directory docker can bind-mount (see above): under backup_dir/.staging, removed by the
+# caller, by the EXIT trap, or by the next backup's sweep if both were skipped.
+WORK_DIR=""
+make_work_dir() {  # <name>  -> sets WORK_DIR
+    WORK_DIR="${CFG_BACKUP_DIR}/.staging/${1}.$$.dir"
+    rm -rf "$WORK_DIR"
+    if ! mkdir -p "$WORK_DIR" 2>/dev/null; then
+        # a read-only backup_dir is fine for a native client: it reads the path directly
+        [[ ${PG_MODE:-} != docker ]] || die "cannot create $WORK_DIR — a containerised client needs a directory docker can bind-mount"
+        WORK_DIR="$RUNDIR/${1}.dir"; rm -rf "$WORK_DIR"; mkdir -p "$WORK_DIR" || die "cannot create $WORK_DIR"
+    fi
+    chmod 700 "$WORK_DIR"; CLEAN_PATHS+=("$WORK_DIR")
 }
 
 # ---------------------------------------------------------------------------
@@ -741,26 +793,30 @@ pg_run() {  # pg_run <binary> [args...]   (stdin/stdout pass through)
     local -a tp=(); mapfile -t tp < <(_timeout_prefix)
     if $DRY_RUN; then printf '  + [%s] %s %s\n' "$PG_MODE" "$bin" "$*" >&2; return 0; fi
     if [[ $PG_MODE == docker ]]; then
-        ${tp[@]+"${tp[@]}"} docker run --rm -i --network "$CFG_DOCKER_NETWORK" \
-            -e PGPASSWORD="$CTX_PASS" ${CTX_SSLMODE:+-e PGSSLMODE="$CTX_SSLMODE"} \
+        _pg_env_exec ${tp[@]+"${tp[@]}"} docker run --rm -i --network "$CFG_DOCKER_NETWORK" \
+            -e PGPASSWORD ${CTX_SSLMODE:+-e PGSSLMODE} \
             ${DOCKER_EXTRA[@]+"${DOCKER_EXTRA[@]}"} "$PG_IMAGE" "$bin" "$@"
     else
-        ${tp[@]+"${tp[@]}"} env PGPASSWORD="$CTX_PASS" ${CTX_SSLMODE:+PGSSLMODE="$CTX_SSLMODE"} "$bin" "$@"
+        _pg_env_exec ${tp[@]+"${tp[@]}"} "$bin" "$@"
     fi
 }
 
 my_run() {  # my_run <binary> [args...]
     local bin="$1"; shift
-    write_my_cnf
     local -a tp=(); mapfile -t tp < <(_timeout_prefix)
     if $DRY_RUN; then printf '  + [%s] %s %s\n' "$MY_MODE" "$bin" "$*" >&2; return 0; fi
+    # one option file per call: a streaming migrate runs the source's and the target's
+    # client at the same time, and a shared file would hand one of them the other's login
+    local cnf rc=0; cnf="$(mktemp "$RUNDIR/my.XXXXXXXX")"; write_my_cnf "$cnf"
     if [[ $MY_MODE == docker ]]; then
-        ${tp[@]+"${tp[@]}"} docker run --rm -i --network "$CFG_DOCKER_NETWORK" \
-            -v "$MY_CNF":/tmp/dbtool.cnf:ro ${DOCKER_EXTRA[@]+"${DOCKER_EXTRA[@]}"} \
-            "$MY_IMAGE" "$bin" --defaults-extra-file=/tmp/dbtool.cnf "$@"
+        DBTOOL_MY_CNF="$(cat "$cnf")" ${tp[@]+"${tp[@]}"} docker run --rm -i --network "$CFG_DOCKER_NETWORK" \
+            -e DBTOOL_MY_CNF ${DOCKER_EXTRA[@]+"${DOCKER_EXTRA[@]}"} --entrypoint sh \
+            "$MY_IMAGE" -c "$MY_CNF_SH" sh "$bin" --defaults-extra-file=/tmp/dbtool.cnf "$@" || rc=$?
     else
-        ${tp[@]+"${tp[@]}"} "$bin" --defaults-extra-file="$MY_CNF" "$@"
+        ${tp[@]+"${tp[@]}"} "$bin" --defaults-extra-file="$cnf" "$@" || rc=$?
     fi
+    rm -f "$cnf"
+    return $rc
 }
 
 # ===========================================================================
@@ -769,10 +825,62 @@ my_run() {  # my_run <binary> [args...]
 comp_ext() { case "$CFG_COMPRESSION" in zstd) echo ".zst";; gzip) echo ".gz";; *) echo "";; esac; }
 compress_stream() {
     case "$CFG_COMPRESSION" in
-        zstd) zstd -T0 -3 -q -c ;;
-        gzip) if have pigz; then pigz -c; else gzip -c; fi ;;
+        zstd) local -a za=(-T0 -q -c) zl="${CFG_COMPRESSION_LEVEL:-3}"
+              (( zl > 19 )) && za+=(--ultra)
+              za+=("-$zl"); [[ ${CFG_ZSTD_LONG:-false} == true ]] && za+=(--long=27)
+              zstd "${za[@]}" ;;
+        gzip) local gl="${CFG_COMPRESSION_LEVEL:-6}"; (( gl > 9 )) && gl=9
+              if have pigz; then pigz "-$gl" -c; else gzip "-$gl" -c; fi ;;
         *)    cat ;;
     esac
+}
+
+# -Z value for pg_dump custom/directory. zstd/lz4 need pg_dump 16+, and are only used
+# when the server is 16+ too, so every client that later restores the dump (always
+# >= the source's major) can read it.
+pg_compress_arg() {
+    local m="${CFG_PG_COMPRESSION:-gzip}" l="${CFG_PG_COMPRESS_LEVEL:-6}" cm=""
+    case "$m" in
+        gzip) (( l > 9 )) && l=9; echo "$l" ;;
+        none) echo 0 ;;
+        zstd|lz4)
+            if [[ $PG_MODE == docker ]]; then cm="${PG_IMAGE##*:}"; cm="${cm%%[!0-9]*}"
+            else cm="$(_native_major pg_dump || true)"; fi
+            if (( ${PG_SERVER_MAJOR:-0} >= 16 && ${cm:-0} >= 16 )); then
+                [[ $m == lz4 ]] && (( l > 12 )) && l=12
+                echo "$m:$l"
+            else
+                warn "pg_compression: $m needs PostgreSQL 16+ on server and client (server ${PG_SERVER_MAJOR:-?}, client ${cm:-?}) — using gzip"
+                (( l > 9 )) && l=9; echo "$l"
+            fi ;;
+        *) warn "unknown pg_compression '$m' (gzip|zstd|lz4|none) — using gzip"; (( l > 9 )) && l=9; echo "$l" ;;
+    esac
+}
+
+to_bytes() {  # 500M / 20G / 1.5T / 1048576 -> bytes; "" -> 0; junk -> -1
+    awk -v s="$1" 'BEGIN { if (s == "") { print 0; exit }
+        u = toupper(s); n = u; sub(/[^0-9.].*$/, "", n); sub(/^[0-9.]+[ ]*/, "", u); sub(/I?B$/, "", u)
+        if (n !~ /^([0-9]+\.?[0-9]*|\.[0-9]+)$/) { print -1; exit }
+        m = 1; if (u == "K") m = 1024; else if (u == "M") m = 1024^2; else if (u == "G") m = 1024^3
+        else if (u == "T") m = 1024^4; else if (u != "") { print -1; exit }
+        printf "%.0f\n", n * m }'
+}
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+file_size()  { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
+fmt_epoch()  { date -d "@$1" +"$2" 2>/dev/null || date -r "$1" +"$2"; }
+free_bytes() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'; }
+
+# min_free_space: a dump that fills the disk can take the server's other services down
+# with it, so check first, prune if that helps, and refuse if it does not.
+ensure_free_space() {
+    local need avail; need="$(to_bytes "${CFG_MIN_FREE_SPACE:-}")"
+    (( need > 0 )) && ! $DRY_RUN || return 0
+    avail="$(free_bytes "$CFG_BACKUP_DIR")"; [[ -n $avail ]] || return 0
+    (( avail >= need )) && return 0
+    warn "only $(human "$avail") free in $CFG_BACKUP_DIR (min_free_space $(human "$need")) — pruning first"
+    prune_backups
+    avail="$(free_bytes "$CFG_BACKUP_DIR")"
+    (( avail >= need )) || die "not enough free space in $CFG_BACKUP_DIR: $(human "$avail") free, min_free_space is $(human "$need") — free space, lower retention, or move backup_dir"
 }
 decompress_stream() {  # decompress_stream <file>
     case "$1" in
@@ -816,6 +924,23 @@ upload_file() {
     esac
 }
 
+remote_delete() {  # <basename> [quiet]  -> remove the off-box copy (keep_remote: false)
+    [[ ${S3_ENABLED:-false} == true && ${S3_KEEP_REMOTE:-true} == false ]] || return 0
+    $NO_UPLOAD && return 0
+    local key="${S3_PREFIX:+$S3_PREFIX/}$1" quiet="${2:-}"
+    if $DRY_RUN; then [[ -n $quiet ]] || log "would delete remote $key"; return 0; fi
+    case "${S3_PROVIDER}" in
+        mc)  have mc || return 0
+             mc rm --quiet "${S3_ALIAS}/${S3_BUCKET}/${key}" >/dev/null 2>&1 \
+                 || [[ -n $quiet ]] || warn "could not delete remote ${S3_ALIAS}/${S3_BUCKET}/${key}" ;;
+        aws) have aws || return 0
+             aws ${S3_PROFILE:+--profile "$S3_PROFILE"} ${S3_ENDPOINT:+--endpoint-url "$S3_ENDPOINT"} \
+                 s3 rm "s3://${S3_BUCKET}/${key}" >/dev/null 2>&1 \
+                 || [[ -n $quiet ]] || warn "could not delete remote s3://${S3_BUCKET}/${key}" ;;
+    esac
+    return 0
+}
+
 notify_failure() {
     [[ -n ${NOTIFY_WEBHOOK:-} ]] || return 0
     have curl || return 0
@@ -837,6 +962,7 @@ build_pg_dump_args() {  # populates DUMPARGS
     for t in ${CTX_INCLUDE[@]+"${CTX_INCLUDE[@]}"};        do DUMPARGS+=(--table="$t"); done
     for t in ${CTX_SCHEMA[@]+"${CTX_SCHEMA[@]}"};          do DUMPARGS+=(--schema="$t"); done
     for t in ${CTX_EXCLUDE_SCHEMA[@]+"${CTX_EXCLUDE_SCHEMA[@]}"}; do DUMPARGS+=(--exclude-schema="$t"); done
+    for t in ${CTX_EXCLUDE_DATA[@]+"${CTX_EXCLUDE_DATA[@]}"};  do DUMPARGS+=(--exclude-table-data="$t"); done
     DUMPARGS+=(${CTX_DUMP_ARGS[@]+"${CTX_DUMP_ARGS[@]}"})
     [[ -n ${SNAP_ID:-} ]] && DUMPARGS+=(--snapshot="$SNAP_ID")
     return 0
@@ -856,6 +982,7 @@ build_my_dump_args() {  # populates DUMPARGS
     for t in ${CTX_EXCLUDE[@]+"${CTX_EXCLUDE[@]}"}; do
         [[ $t == *.* ]] && DUMPARGS+=(--ignore-table="$t") || DUMPARGS+=(--ignore-table="${CTX_DB}.${t}")
     done
+    (( ${#CTX_EXCLUDE_DATA[@]} )) && warn "exclude_table_data is PostgreSQL only — ignored for $CTX_LABEL (use exclude_tables)"
     DUMPARGS+=(${CTX_DUMP_ARGS[@]+"${CTX_DUMP_ARGS[@]}"})
     DUMPARGS+=("$CTX_DB")
     DUMPARGS+=(${CTX_INCLUDE[@]+"${CTX_INCLUDE[@]}"})
@@ -919,6 +1046,15 @@ dump_target() {  # dump_target <final-path>  -> path to redirect the dump into
 # anything left here is orphaned.
 sweep_stale_parts() {
     local -a stale=()
+    # work/staging dirs of runs that were killed (or of versions before 1.4.0, which left
+    # every directory-format staging copy behind); a day old means no live run owns them
+    mapfile -t stale < <(find "$CFG_BACKUP_DIR/.staging" -mindepth 1 -maxdepth 1 -type d -name '*.dir' -mmin +1440 2>/dev/null)
+    local d
+    for d in ${stale[@]+"${stale[@]}"}; do
+        $DRY_RUN && { log "would remove stale $(basename "$d")"; continue; }
+        rm -rf "$d" && warn "removed stale staging dir $(basename "$d") from an earlier run"
+    done
+    stale=()
     mapfile -t stale < <(find "$CFG_BACKUP_DIR" -maxdepth 1 -type f -name '*.part' 2>/dev/null)
     (( ${#stale[@]} )) || return 0
     local f
@@ -1002,6 +1138,7 @@ backup_one() {
     fi
     CTX_LABEL="$label"
     resolve_client
+    ensure_free_space
 
     local ts base tmp final start elapsed size
     ts="$(date +"$CFG_TIMESTAMP_FORMAT")"
@@ -1026,8 +1163,9 @@ backup_one() {
         case "$CTX_FORMAT" in
             custom)
                 final="${base}.dump"; tmp="$(dump_target "$final")"
-                log "dumping $label (pg custom, level $CFG_PG_COMPRESS_LEVEL) -> $(basename "$final")"
-                pg_run pg_dump "${DUMPARGS[@]}" -Fc -Z "$CFG_PG_COMPRESS_LEVEL" >"$tmp" \
+                local zarg; zarg="$(pg_compress_arg)"
+                log "dumping $label (pg custom, -Z $zarg) -> $(basename "$final")"
+                pg_run pg_dump "${DUMPARGS[@]}" -Fc -Z "$zarg" >"$tmp" \
                     || { rm -f "$tmp"; die "pg_dump failed for $label"; }
                 ;;
             plain)
@@ -1044,11 +1182,14 @@ backup_one() {
                 final="${base}.dir.tar$(comp_ext)"; tmp="$(dump_target "$final")"
                 log "dumping $label (pg directory, -j $CTX_JOBS) -> $(basename "$final")"
                 DOCKER_EXTRA=(-v "$STAGEDIR":"$STAGEDIR" --user "$(id -u):$(id -g)")
-                pg_run pg_dump "${DUMPARGS[@]}" -Fd -j "$CTX_JOBS" -f "$dumpdir" \
-                    || { DOCKER_EXTRA=(); rm -f "$tmp"; die "pg_dump failed for $label"; }
+                pg_run pg_dump "${DUMPARGS[@]}" -Fd -j "$CTX_JOBS" -Z "$(pg_compress_arg)" -f "$dumpdir" \
+                    || { DOCKER_EXTRA=(); rm -f "$tmp"; rm -rf "$dumpdir"; die "pg_dump failed for $label"; }
                 DOCKER_EXTRA=()
                 $DRY_RUN || tar -C "$STAGEDIR" -cf - "$(basename "$dumpdir")" | compress_stream >"$tmp" \
-                    || { rm -f "$tmp"; die "packing the directory dump failed for $label"; }
+                    || { rm -f "$tmp"; rm -rf "$dumpdir"; die "packing the directory dump failed for $label"; }
+                # CLEAN_PATHS is only appended to inside this run's subshell, so the EXIT trap
+                # never sees it: drop the staged copy here or it stays, uncompressed, forever
+                rm -rf "$dumpdir"
                 ;;
             *) die "unknown postgres format '$CTX_FORMAT' (custom|plain|directory)" ;;
         esac
@@ -1067,6 +1208,19 @@ backup_one() {
     chmod 640 "$final"
 
     verify_dump_artifact "$final" || { rm -f "$final"; die "integrity check failed — discarded $(basename "$final")"; }
+
+    # exclude_table_data keeps a table's definition but not its rows; only the dump knows
+    # which tables that matched, so a restore of it is expected to have them empty
+    if [[ -n $fp_tmp && -s $fp_tmp ]] && { (( ${#CTX_EXCLUDE_DATA[@]} )) || [[ " ${CTX_DUMP_ARGS[*]-} " == *--exclude-table-data* ]]; }; then
+        if dump_row_counts "$final" "$RUNDIR/fp.dumpdata.tsv" && [[ -s $RUNDIR/fp.dumpdata.tsv ]]; then
+            awk -F'\t' -v OFS='\t' 'NR == FNR { d[$2 "\t" $3] = 1; next }
+                $1 == "table" && !(($2 "\t" $3) in d) { $4 = 0; if ($5 != "-") $5 = 0 } { print }' \
+                "$RUNDIR/fp.dumpdata.tsv" "$fp_tmp" >"$fp_tmp.x" && mv "$fp_tmp.x" "$fp_tmp"
+        else
+            warn "could not list the dump's data to account for exclude_table_data — no fingerprint for $label"; fp_tmp=""
+        fi
+        DOCKER_EXTRA=()
+    fi
 
     if [[ -n $fp_tmp && -s $fp_tmp ]]; then
         { printf '# dbtool fingerprint v1  mode=%s  server=%s  source=%s:%s/%s  taken=%s\n' \
@@ -1180,7 +1334,10 @@ cmd_globals() {
 # ===========================================================================
 prune_backups() {
     local days="${CFG_RETENTION_DAYS:-0}" keep="${CFG_RETENTION_MIN_KEEP:-0}"
-    (( days > 0 )) || return 0
+    local kd="${CFG_KEEP_DAILY:-0}" kw="${CFG_KEEP_WEEKLY:-0}" km="${CFG_KEEP_MONTHLY:-0}" ky="${CFG_KEEP_YEARLY:-0}"
+    local cap; cap="$(to_bytes "${CFG_RETENTION_MAX_SIZE:-}")"
+    local gfs=false; (( kd + kw + km + ky > 0 )) && gfs=true
+    (( days > 0 || cap > 0 )) || $gfs || return 0
     # A whole-server entry never names a file itself: its dumps carry
     # <entry>_<db>, and the bare name would glob across all of them.
     local -a names=() cn=()
@@ -1195,24 +1352,76 @@ prune_backups() {
                           | sed -E 's/.*"label": *"([^"]*)".*/\1/' | sort -u)
     names+=(${lnames[@]+"${lnames[@]}"})
     mapfile -t names < <(printf '%s\n' ${names[@]+"${names[@]}"} | sed '/^$/d' | sort -u)
-    local n f removed=0
+    local n f removed=0 freed=0 now; now="$(date +%s)"
+    local -a survivors=()
+    local -A kept=() mt=()
     for n in ${names[@]+"${names[@]}"}; do
         [[ -z $n ]] && continue
         local -a files=()
         mapfile -t files < <(backups_for "$n")
+        kept=(); mt=()
         local idx=0
         for f in ${files[@]+"${files[@]}"}; do
+            idx=$((idx+1)); mt[$f]="$(file_mtime "$f")"
+            (( idx <= keep )) && kept[$f]="newest $keep"
+        done
+        # GFS: the newest backup in each of the last N days / weeks / months / years that
+        # have one. Older backups in the same bucket go once retention_days has passed.
+        if $gfs; then
+            local spec tn tf key cnt
+            for spec in "$kd|%Y-%m-%d|daily" "$kw|%G-W%V|weekly" "$km|%Y-%m|monthly" "$ky|%Y|yearly"; do
+                IFS='|' read -r tn tf key <<<"$spec"
+                (( tn > 0 )) || continue
+                local -A seen=(); cnt=0
+                for f in ${files[@]+"${files[@]}"}; do
+                    (( cnt < tn )) || break
+                    local b; b="$(fmt_epoch "${mt[$f]}" "$tf")"
+                    [[ -n ${seen[$b]:-} ]] && continue
+                    seen[$b]=1; cnt=$((cnt+1)); kept[$f]="${kept[$f]:+${kept[$f]}, }$key"
+                done
+            done
+        fi
+        idx=0
+        for f in ${files[@]+"${files[@]}"}; do
             idx=$((idx+1))
-            (( idx <= keep )) && continue
-            if [[ -n $(find "$f" -mtime "+$((days-1))" -print -quit 2>/dev/null) ]]; then
-                $DRY_RUN && { log "would prune $(basename "$f")"; continue; }
-                rm -f "$f" "${f}.sha256" "${f}.meta.json" "${f}.fingerprint.tsv"
-                removed=$((removed+1))
+            local old=false m="${mt[$f]}"
+            if (( days > 0 )); then (( now - m >= days * 86400 )) && old=true
+            elif $gfs; then old=true; fi
+            if [[ -z ${kept[$f]:-} ]] && $old; then
+                prune_remove "$f" "older than retention"
+            else
+                survivors+=("${mt[$f]}"$'\t'"$(file_size "$f")"$'\t'"$idx"$'\t'"$f")
             fi
         done
     done
-    (( removed > 0 )) && log "pruned $removed old backup(s) (retention ${days}d, keep ${keep})"
+
+    # retention_max_size: drop the oldest dumps until the rest fit, but never below
+    # retention_min_keep (at least 1) for any database.
+    if (( cap > 0 )); then
+        local total=0 line t sz rank
+        for line in ${survivors[@]+"${survivors[@]}"}; do total=$(( total + $(cut -f2 <<<"$line") )); done
+        if (( total > cap )); then
+            local floor=$(( keep > 1 ? keep : 1 ))
+            while IFS=$'\t' read -r t sz rank f; do
+                (( total > cap )) || break
+                (( rank <= floor )) && continue
+                prune_remove "$f" "over retention_max_size"; total=$(( total - sz ))
+            done < <(printf '%s\n' "${survivors[@]}" | sort -t$'\t' -k1,1n)
+            (( total > cap )) && warn "backups still use $(human "$total"), over retention_max_size $(human "$cap"): the newest ${floor} per database are kept regardless"
+        fi
+    fi
+    (( removed > 0 )) && log "pruned $removed old backup(s), $(human "$freed") freed (retention ${days}d, keep ${keep}$($gfs && printf ', GFS d%s/w%s/m%s/y%s' "$kd" "$kw" "$km" "$ky")$( (( cap > 0 )) && printf ', cap %s' "$(human "$cap")"))"
     return 0
+}
+
+prune_remove() {  # <file> <reason>   (uses removed/freed of the caller)
+    local f="$1" sc
+    if $DRY_RUN; then log "would prune $(basename "$f") ($2)"; return 0; fi
+    freed=$(( freed + $(file_size "$f" 2>/dev/null || echo 0) ))
+    rm -f "$f" "${f}.sha256" "${f}.meta.json" "${f}.fingerprint.tsv"
+    removed=$((removed+1))
+    remote_delete "$(basename "$f")"
+    for sc in sha256 meta.json fingerprint.tsv; do remote_delete "$(basename "$f").$sc" quiet; done
 }
 
 # ===========================================================================
@@ -1343,10 +1552,10 @@ dump_row_counts() {  # <dump file> <outfile>   (client already picked for the du
             pg_run pg_restore --data-only -f - "$fdir/$(basename "$f")" | awk "$FP_COPY_AWK" >"$2"
             DOCKER_EXTRA=() ;;
         *.dir.tar*)
-            local xdir="$RUNDIR/count.dir"; rm -rf "$xdir"; mkdir -p "$xdir"
+            make_work_dir count; local xdir="$WORK_DIR"
             decompress_stream "$f" | tar -C "$xdir" -xf -
             local inner; inner="$(find "$xdir" -maxdepth 1 -mindepth 1 -type d | head -1)"
-            DOCKER_EXTRA=(-v "$RUNDIR":"$RUNDIR":ro)
+            DOCKER_EXTRA=(-v "$xdir":"$xdir":ro)
             pg_run pg_restore --data-only -f - -Fd "$inner" | awk "$FP_COPY_AWK" >"$2"
             DOCKER_EXTRA=(); rm -rf "$xdir" ;;
         *)  decompress_stream "$f" | awk "$FP_COPY_AWK" >"$2" ;;
@@ -1366,6 +1575,33 @@ fp_filter_by_dump_args() {  # <fingerprint>   (CTX_* = source, DUMPARGS built, s
     [[ -s $toc ]] || return 0
     awk -F'\t' 'NR == FNR { keep[$0] = 1; next }
                 $1 != "table" || (($2 " " $3) in keep)' "$toc" "$fp" >"$fp.f" && mv "$fp.f" "$fp"
+}
+
+# --exclude-table-data leaves a table's rows out of the dump, so a streaming migrate has to
+# expect that table empty on the target. pg_dump's own pattern matching decides which tables
+# those are: they vanish from a schema-only TOC once the same patterns are passed as
+# --exclude-table. (Same preconditions as fp_filter_by_dump_args.)
+fp_zero_excluded_data() {  # <fingerprint>
+    local fp="$1" i a all="$RUNDIR/toc.all" kept="$RUNDIR/toc.kept"
+    local sedx='s/^[0-9]*; [0-9]* [0-9]* TABLE \(.*\) [^ ]*$/\1/p'
+    local -a base=() pats=() ex=()
+    for ((i = 0; i < ${#DUMPARGS[@]}; i++)); do
+        a="${DUMPARGS[i]}"
+        case "$a" in
+            --exclude-table-data=*) pats+=("${a#*=}") ;;
+            --exclude-table-data)   pats+=("${DUMPARGS[i+1]:-}"); i=$((i + 1)) ;;
+            *) base+=("$a") ;;
+        esac
+    done
+    (( ${#pats[@]} )) || return 0
+    for a in "${pats[@]}"; do ex+=(--exclude-table="$a"); done
+    DOCKER_EXTRA=()
+    { pg_run pg_dump "${base[@]}" --schema-only -Fc -Z 0 | pg_run pg_restore -l 2>/dev/null | sed -n "$sedx" >"$all"; } || true
+    { pg_run pg_dump "${base[@]}" "${ex[@]}" --schema-only -Fc -Z 0 | pg_run pg_restore -l 2>/dev/null | sed -n "$sedx" >"$kept"; } || true
+    [[ -s $all && -s $kept ]] || return 0
+    awk -F'\t' -v OFS='\t' 'FILENAME == ARGV[1] { all[$0] = 1; next } FILENAME == ARGV[2] { kept[$0] = 1; next }
+        $1 == "table" && (($2 " " $3) in all) && !(($2 " " $3) in kept) { $4 = 0; if ($5 != "-") $5 = 0 } { print }' \
+        "$all" "$kept" "$fp" >"$fp.x" && mv "$fp.x" "$fp" || true
 }
 
 # --- compare -------------------------------------------------------------------
@@ -1524,9 +1760,15 @@ pg_analyze_ctx() {  # refresh planner statistics after a load — pg_dump does n
 }
 
 cmd_compare() {
-    local -a pos=(); local dump="" latest="" mode=counts sdb="" tdb=""
+    local -a pos=() samples=(); local dump="" latest="" mode=counts sdb="" tdb=""
+    local srows=5 skey="" swhere="" swidth=40
     while (( $# )); do
         case "$1" in
+            --sample)      samples+=("$2"); shift 2 ;;
+            --rows)        srows="$2"; shift 2 ;;
+            --key)         skey="$2"; shift 2 ;;
+            --where)       swhere="$2"; shift 2 ;;
+            --width)       swidth="$2"; shift 2 ;;
             --dump)        dump="$2"; shift 2 ;;
             --latest)      latest="$2"; shift 2 ;;
             --full)        mode=full; shift ;;
@@ -1549,8 +1791,336 @@ cmd_compare() {
     [[ -z $dump || -f $dump ]] || die "dump not found: $dump"
     [[ -n $src || -n $dump ]] || die "compare needs a source, a dump (--dump/--latest), or both"
     [[ -n $dump ]] && log "dump: $(basename "$dump")"
+    if (( ${#samples[@]} )); then
+        [[ $srows =~ ^[0-9]+$ ]] && (( srows >= 1 && srows <= 1000 )) || die "--rows must be 1..1000"
+        [[ $swidth =~ ^[0-9]+$ ]] && (( swidth >= 20 )) || die "--width must be a number >= 20"
+        $DRY_RUN && { log "would sample ${srows} row(s) of ${samples[*]} in ${tgt}${src:+, $src}${dump:+, $(basename "$dump")}"; return 0; }
+        local t rc=0
+        for t in "${samples[@]}"; do
+            sample_table "$t" "$srows" "$skey" "$swhere" "$swidth" "$dump" "$src" "$sdb" "$tgt" "$tdb" || rc=1
+        done
+        return $rc
+    fi
     $DRY_RUN && { log "would fingerprint ${tgt}${src:+ and $src}${dump:+ and compare with $(basename "$dump")}"; return 0; }
     verify_data "$mode" "$dump" "$src" "$sdb" "$tgt" "$tdb"
+}
+
+# ===========================================================================
+#  SAMPLE — random rows shown side by side: restored / dump / live source
+# ===========================================================================
+# Counts and checksums say *that* a table differs; a sample shows *what* the rows
+# hold. Rows are picked at random from the restored database by primary key (or
+# a NOT NULL unique key, or --key), then the same keys are read from the live
+# source and from the dump. Dump rows are loaded into a TEMP table on the target
+# first, so all three sides print through one session with the same settings
+# (time zone, DateStyle, float digits, bytea format) and compare as plain text.
+
+SAMPLE_SET="SET TimeZone = 'UTC'; SET DateStyle = 'ISO, YMD'; SET IntervalStyle = 'postgres';
+SET extra_float_digits = 3; SET bytea_output = 'hex'; SET lc_monetary = 'C'; SET client_encoding = 'UTF8';"
+
+sqlq() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
+sqli() { local s="${1//\"/\"\"}"; printf '"%s"' "$s"; }
+
+ctx_psql_script() {  # script on stdin -> rows on stdout   (CTX_* + resolved client)
+    DOCKER_EXTRA=()
+    pg_run psql -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$CTX_DB" --no-password \
+        -qtAX -v ON_ERROR_STOP=1 -f - 2>"$RUNDIR/sample.err"
+}
+sample_err() {  # the server's own ERROR/FATAL text, else the last stderr lines
+    local e; e="$(sed -n 's/^.*\(ERROR\|FATAL\):  *//p' "$RUNDIR/sample.err" 2>/dev/null | head -1)"
+    [[ -n $e ]] || e="$(grep -v '^$' "$RUNDIR/sample.err" 2>/dev/null | tail -2 | tr '\n' ' ')"
+    printf '%s' "$e"
+}
+
+# dump_data_stream <dump> [pg_restore filter args...] -> the dump's data as SQL on stdout
+dump_data_stream() {
+    local f="$1"; shift
+    local fdir; fdir="$(cd "$(dirname "$f")" && pwd)"
+    case "$f" in
+        *.dump)
+            DOCKER_EXTRA=(-v "$fdir":"$fdir":ro)
+            pg_run pg_restore --data-only "$@" -f - "$fdir/$(basename "$f")"
+            DOCKER_EXTRA=() ;;
+        *.dir.tar*)
+            make_work_dir data; local xdir="$WORK_DIR"
+            decompress_stream "$f" | tar -C "$xdir" -xf -
+            local inner; inner="$(find "$xdir" -maxdepth 1 -mindepth 1 -type d | head -1)"
+            DOCKER_EXTRA=(-v "$xdir":"$xdir":ro)
+            pg_run pg_restore --data-only "$@" -f - -Fd "$inner"
+            DOCKER_EXTRA=(); rm -rf "$xdir" ;;
+        *)  decompress_stream "$f" ;;
+    esac
+}
+
+# From a dump's data stream, keep one table's COPY block, only the rows whose key
+# is in <keyfile>, rewritten to load into pg_temp._dbtool_sample. KC names the key
+# columns to match as text (empty: keep every row; the final pick is done in SQL, on
+# typed values). Control lines go to the file CTL, never into the data.
+SAMPLE_DUMP_AWK='
+function unq(s) { if (s ~ /^".*"$/) { s = substr(s, 2, length(s) - 2); gsub(/""/, "\"", s) } return s }
+NR == FNR { want[$0] = 1; next }
+!inb && /^SET client_encoding = / { enc = $0; next }
+!inb && !done && /^COPY / && / FROM stdin;$/ {
+    rest = substr($0, 6); sch = "public"
+    if (match(rest, /^("([^"]|"")*"|[^."]+)\./)) { sch = substr(rest, 1, RLENGTH - 1); rest = substr(rest, RLENGTH + 1) }
+    tbl = rest; if (match(rest, /^("([^"]|"")*"|[^ "]+)/)) tbl = substr(rest, 1, RLENGTH)
+    if (unq(sch) != S || unq(tbl) != T) next
+    rest = substr(rest, length(tbl) + 1); sub(/^ *\(/, "", rest); sub(/\) FROM stdin;$/, "", rest)
+    cols = rest; n = 0; cur = ""; q = 0
+    for (i = 1; i <= length(rest); i++) {
+        ch = substr(rest, i, 1)
+        if (ch == "\"") q = !q
+        if (!q && ch == ",") { name[++n] = unq(cur); cur = ""; continue }
+        if (!q && ch == " " && cur == "") continue
+        cur = cur ch
+    }
+    name[++n] = unq(cur)
+    nk = split(KC, kc, "\t")
+    for (j = 1; j <= nk; j++) { kp[j] = 0; for (i = 1; i <= n; i++) if (name[i] == kc[j]) kp[j] = i
+                                if (!kp[j]) { print "NOKEY\t" kc[j] > CTL; done = 1; next } }
+    print "FOUND" > CTL
+    if (enc != "") print enc
+    print "COPY pg_temp._dbtool_sample (" cols ") FROM STDIN;"
+    inb = 1; next
+}
+inb && $0 == "\\." { print "\\."; inb = 0; done = 1; next }
+inb { if (nk) { k = $(kp[1]); for (j = 2; j <= nk; j++) k = k "\t" $(kp[j]) }
+      if (!nk || k in want) { print; got++ } }
+END { printf "GOT\t%d\n", got + 0 > CTL }'
+
+# Print the side-by-side view. Args: src=T file [src=D file] [src=L file]; -v NK COLS BINS W
+# (BINS: 1 per bytea column.) Lengths and padding count characters: mawk counts bytes.
+SAMPLE_VIEW_AWK='
+function ulen(s,   t) { if (!BYTES) return length(s); t = s; return length(s) - gsub(/[\200-\277]/, "", t) }
+function usub(s, n,   i, c, L) {   # the first n characters, never half of a multi-byte one
+    if (!BYTES) return substr(s, 1, n)
+    L = length(s); c = 0
+    for (i = 1; i <= L; i++) if (substr(s, i, 1) !~ /[\200-\277]/ && ++c > n) break
+    return substr(s, 1, i - 1) }
+function pad(s, w) { return s substr(SP, 1, w - ulen(s)) }
+function isbx(v, bin) { return bin && substr(v, 1, 3) == "\\\\x" }
+function show(v, bin,   n) {
+    if (v == "\\N") return "NULL"
+    if (v == "") return "\047\047"
+    if (isbx(v, bin)) { v = substr(v, 2); n = (length(v) - 2) / 2
+        if (length(v) > W) return substr(v, 1, W - 16) "... (" n " bytes)"; return v }
+    if (ulen(v) > W) return usub(v, W - 14) "... (len " ulen(v) ")"
+    return v }
+function firstdiff(a, b,   i, m) { m = length(a) < length(b) ? length(a) : length(b)
+    for (i = 1; i <= m; i++) if (substr(a, i, 1) != substr(b, i, 1)) break
+    if (BYTES) { while (i > 1 && substr(a, i, 1) ~ /[\200-\277]/) i--; i = ulen(substr(a, 1, i - 1)) + 1 }
+    return i }
+function cell(v, base, bin,   p) {
+    if (v == base) return "="
+    if (v == "\\N" || base == "\\N" || (ulen(v) <= W && ulen(base) <= W)) return "DIFF " show(v, bin)
+    p = firstdiff(v, base); if (isbx(v, bin) && isbx(base, bin) && p > 3) p--   # \\x is one backslash on screen
+    return "DIFF@" p " " show(v, bin) }
+BEGIN { FS = "\t"; BYTES = (length("\303\251") == 2)
+    nc = split(COLS, col, "\t"); split(KEYS, kn, "\t"); split(BINS, isb, "\t"); cw = 6
+    for (i = 1; i <= nc; i++) if (ulen(col[i]) > cw) cw = ulen(col[i])
+    SP = sprintf("%" (cw + W + 20) "s", "") }
+{ k = $1; for (j = 2; j <= NK; j++) k = k "\t" $j
+  have[src] = 1; row[src, k] = $0; if (src == "T") ord[++nt] = k }
+END {
+    hasD = DUMP; hasL = LIVE
+    hdr = "  " pad("COLUMN", cw) "  " pad("RESTORED", W)
+    if (hasD) hdr = hdr "  " pad("DUMP", W)
+    if (hasL) hdr = hdr "  SOURCE(now)"
+    for (r = 1; r <= nt; r++) {
+        k = ord[r]; split(row["T", k], tv, "\t")
+        kd = ""; for (j = 1; j <= NK; j++) kd = kd (j > 1 ? ", " : "") kn[j] "=" show(tv[j], 0)
+        printf "\n-- row %d/%d  key: %s\n%s\n", r, nt, kd, hdr
+        inD = (("D", k) in row); inL = (("L", k) in row)
+        if (inD) split(row["D", k], dv, "\t"); if (inL) split(row["L", k], lv, "\t")
+        nd = 0; nl = 0
+        for (i = 1; i <= nc; i++) {
+            t = tv[NK + i]; line = "  " pad(col[i], cw) "  " pad(show(t, isb[i]), W)
+            if (hasD) { d = inD ? cell(dv[NK + i], t, isb[i]) : "(no such row)"; if (inD && dv[NK + i] != t) nd++
+                        line = line "  " pad(d, W) }
+            if (hasL) { l = inL ? cell(lv[NK + i], t, isb[i]) : "(no such row)"; if (inL && lv[NK + i] != t) nl++
+                        line = line "  " l }
+            print line
+        }
+        v = ""
+        if (hasD) { if (!inD) { v = "NOT IN DUMP"; bad++ } else if (nd) { v = "DIFFERS from dump (" nd " column(s))"; bad++ } else { v = "MATCHES dump"; okd++ } }
+        if (hasL) {
+            if (!inL)    s = hasD ? "deleted in source since backup" : "NOT IN SOURCE"
+            else if (nl) s = hasD ? "changed in source since backup (" nl " column(s))" : "DIFFERS from source (" nl " column(s))"
+            else       { s = "matches source"; okl++ }
+            if (!hasD && s ~ /^(NOT|DIFFERS)/) bad++
+            v = v (v != "" ? "; " : "") s
+        }
+        printf "  => %s\n", v
+    }
+    printf "#SUMMARY\t%d\t%d\t%d\t%d\n", nt, bad + 0, okd + 0, okl + 0
+}'
+
+# sample_table <spec> <rows> <key csv|""> <where|""> <width> <dump|""> <src|""> <sdb|""> <tgt> <tdb|"">
+sample_table() {
+    local spec="$1" nrows="$2" keyopt="$3" where="$4" width="$5" dump="$6" src="$7" sdb="$8" tgt="$9" tdb="${10}"
+    local wd="$RUNDIR/sample"; rm -rf "$wd"; mkdir -p "$wd"
+    local sch="" tbl="$spec"
+    [[ $spec == *.* ]] && { sch="${spec%%.*}"; tbl="${spec#*.}"; }
+
+    # --- restored database: resolve the table, its columns and a key ------------
+    load_target_entry "$tgt"; use_ctx DST_; [[ -n $tdb ]] && CTX_DB="$tdb"
+    [[ $CTX_ENGINE == postgres ]] || die "sample supports PostgreSQL only"
+    local tlabel="${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
+    resolve_client
+    local cond="c.relname = $(sqlq "$tbl")"; [[ -n $sch ]] && cond+=" AND n.nspname = $(sqlq "$sch")"
+    local -a hits=()
+    mapfile -t hits < <(printf '%s\n' "\\pset fieldsep '\\t'" \
+        "SELECT c.oid, n.nspname, c.relname, c.relkind, greatest(c.reltuples, 0)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r','p') AND $cond AND $FP_NS_FILTER ORDER BY 2;" | ctx_psql_script | grep -v '^$')
+    (( ${#hits[@]} )) || [[ ! -s $RUNDIR/sample.err ]] || die "cannot read the catalog of ${tlabel}: $(sample_err)"
+    (( ${#hits[@]} )) || die "table '$spec' not found in ${tlabel}"
+    (( ${#hits[@]} == 1 )) || die "'$spec' is ambiguous in ${tlabel}; give schema.table: $(printf '%s\n' "${hits[@]}" | cut -f2,3 | tr '\t' . | paste -sd' ' -)"
+    local oid relkind est
+    IFS=$'\t' read -r oid sch tbl relkind est <<<"${hits[0]}"
+    [[ $relkind == r ]] || die "'$sch.$tbl' is partitioned and holds no rows itself; sample one of its partitions"
+    local qrel; qrel="$(sqli "$sch").$(sqli "$tbl")"
+
+    local gen=""; (( ${PG_SERVER_MAJOR:-17} >= 12 )) && gen="AND a.attgenerated = ''"
+    local -a cols=() types=() keys=()
+    local line
+    while IFS=$'\t' read -r line; do
+        [[ -n $line ]] || continue
+        cols+=("${line%%$'\t'*}"); types+=("${line#*$'\t'}")
+    done < <(printf '%s\n' "\\pset fieldsep '\\t'" \
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) FROM pg_attribute a
+          WHERE a.attrelid = $oid AND a.attnum > 0 AND NOT a.attisdropped $gen ORDER BY a.attnum;" | ctx_psql_script)
+    (( ${#cols[@]} )) || die "no columns read for $sch.$tbl: $(sample_err)"
+
+    if [[ -n $keyopt ]]; then
+        IFS=, read -r -a keys <<<"$keyopt"
+    else
+        local nka="i.indnkeyatts"; (( ${PG_SERVER_MAJOR:-17} >= 11 )) || nka="i.indnatts"
+        mapfile -t keys < <(printf '%s\n' \
+            "SELECT a.attname FROM (SELECT i.indkey, $nka AS nk FROM pg_index i
+                WHERE i.indrelid = $oid AND i.indisunique AND i.indpred IS NULL AND i.indexprs IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM pg_attribute a2 WHERE a2.attrelid = i.indrelid
+                                   AND a2.attnum = ANY (i.indkey::int2[]) AND NOT a2.attnotnull)
+                ORDER BY i.indisprimary DESC, i.indnatts LIMIT 1) x
+              CROSS JOIN LATERAL unnest((x.indkey::int2[])[0:x.nk - 1]) WITH ORDINALITY k(n, o)
+              JOIN pg_attribute a ON a.attrelid = $oid AND a.attnum = k.n ORDER BY k.o;" | ctx_psql_script | grep -v '^$')
+        (( ${#keys[@]} )) || die "$sch.$tbl has no primary key or NOT NULL unique key; name the columns that identify a row with --key col1,col2"
+    fi
+    local -a ktypes=(); local k i found
+    for k in "${keys[@]}"; do
+        found=""
+        for i in "${!cols[@]}"; do [[ ${cols[i]} == "$k" ]] && { found="${types[i]}"; break; }; done
+        [[ -n $found ]] || die "--key column '$k' is not a column of $sch.$tbl"
+        ktypes+=("$found")
+    done
+
+    local klist="" lit="" allc="" c
+    for i in "${!keys[@]}"; do
+        klist+="${klist:+, }$(sqli "${keys[i]}")"
+        lit+="${lit:+, }quote_nullable($(sqli "${keys[i]}"))||'::'||$(sqlq "${ktypes[i]}")"
+    done
+    for c in "${cols[@]}"; do allc+="${allc:+, }$(sqli "$c")"; done
+    local wh="" knn=""
+    if [[ -n $keyopt ]]; then   # a NULL key cannot be read back by key
+        for k in "${keys[@]}"; do knn+="${knn:+ AND }$(sqli "$k") IS NOT NULL"; done
+    fi
+    [[ -n $where ]] && wh="($where)"; [[ -z $knn ]] || wh+="${wh:+ AND }$knn"
+    local samp=""
+    # ORDER BY random() reads the whole table; on a big one, sample ~50x the rows first
+    if [[ -z $where ]] && (( est > 200000 )); then
+        samp="TABLESAMPLE SYSTEM ($(awk -v n="$nrows" -v e="$est" 'BEGIN { p = n * 5000 / e; if (p > 100) p = 100; if (p < 0.0001) p = 0.0001; printf "%.4f", p }'))"
+    fi
+    log "sampling ${nrows} random row(s) of ${sch}.${tbl} in restored ${tlabel} (key: ${keys[*]})"
+    local -a tuples=()
+    mapfile -t tuples < <(printf '%s\n' "$SAMPLE_SET" \
+        "SELECT '(' || concat_ws(', ', $lit) || ')' FROM ONLY $qrel $samp ${wh:+WHERE $wh} ORDER BY random() LIMIT $nrows;" \
+        | ctx_psql_script | grep -v '^$')
+    (( ${#tuples[@]} )) || [[ ! -s $RUNDIR/sample.err ]] || die "sampling ${sch}.${tbl} failed: $(sample_err)"
+    if (( ${#tuples[@]} == 0 )) && [[ -n $samp ]]; then
+        mapfile -t tuples < <(printf '%s\n' "$SAMPLE_SET" \
+            "SELECT '(' || concat_ws(', ', $lit) || ')' FROM ONLY $qrel ${knn:+WHERE $knn} ORDER BY random() LIMIT $nrows;" \
+            | ctx_psql_script | grep -v '^$') || true
+    fi
+    (( ${#tuples[@]} )) || die "no rows to sample in ${sch}.${tbl} on ${tlabel}${where:+ matching --where}"
+    local pred; pred="($klist) IN (VALUES $(IFS=,; printf '%s' "${tuples[*]}"))"
+    local fetch="COPY (SELECT $klist, $allc FROM ONLY @REL@ WHERE $pred ORDER BY $klist) TO STDOUT;"
+
+    printf '%s\n' "$SAMPLE_SET" "${fetch//@REL@/$qrel}" | ctx_psql_script >"$wd/T.rows" \
+        || die "reading sampled rows from ${tlabel} failed: $(sample_err)"
+    [[ -s $wd/T.rows ]] || die "none of the sampled rows of ${sch}.${tbl} could be read back by key (${keys[*]})"
+    awk -F'\t' -v NK="${#keys[@]}" '{ k = $1; for (j = 2; j <= NK; j++) k = k "\t" $j; if (k in s) d++; s[k] = 1 }
+        END { exit (d > 0) }' "$wd/T.rows" \
+        || die "key (${keys[*]}) does not identify a row of ${sch}.${tbl} uniquely; add the columns that do, with --key"
+
+    # --- dump: the same keys, loaded through a TEMP table on the target ---------
+    local hasD=0 hasL=0
+    if [[ -n $dump ]]; then
+        # a time-zone key prints differently in the dump (written in the source's zone): the
+        # filter matches the other key columns as text and SQL then picks exact rows by value
+        local -a kcm=() kfs=()
+        for i in "${!keys[@]}"; do
+            [[ ${ktypes[i]} == *"with time zone"* ]] || { kcm+=("${keys[i]}"); kfs+=("$((i + 1))"); }
+        done
+        (( ${#kfs[@]} )) || log "no key column can be matched as text: reading all of ${sch}.${tbl} from the dump"
+        cut -f"$(IFS=,; printf '%s' "${kfs[*]:-1}")" "$wd/T.rows" >"$wd/keys"
+        CTX_ENGINE=postgres; CTX_PASS=""; CTX_SSLMODE=""
+        pick_pg_client_for_dump "$dump"
+        local -a fa=(); [[ $dump == *.dump || $dump == *.dir.tar* ]] && fa=(-n "$sch" -t "$tbl")
+        log "reading the same rows from $(basename "$dump")"
+        : >"$wd/D.ctl"
+        { dump_data_stream "$dump" ${fa[@]+"${fa[@]}"} 2>"$RUNDIR/sample.dump.err" || true; } \
+            | awk -F'\t' -v S="$sch" -v T="$tbl" -v KC="$(IFS=$'\t'; printf '%s' "${kcm[*]-}")" -v CTL="$wd/D.ctl" "$SAMPLE_DUMP_AWK" "$wd/keys" - >"$wd/D.load"
+        DOCKER_EXTRA=()
+        if grep -q '^NOKEY' "$wd/D.ctl"; then
+            warn "the dump's ${sch}.${tbl} has no column $(sed -n 's/^NOKEY\t//p' "$wd/D.ctl") — skipping the dump"
+        elif ! grep -q '^FOUND' "$wd/D.ctl"; then
+            warn "$(basename "$dump") holds no data for ${sch}.${tbl}$( [[ -s $RUNDIR/sample.dump.err ]] && printf ' (%s)' "$(tail -1 "$RUNDIR/sample.dump.err")")"
+            hasD=1; : >"$wd/D.rows"
+        else
+            load_target_entry "$tgt"; use_ctx DST_; [[ -n $tdb ]] && CTX_DB="$tdb"; resolve_client
+            if { printf '%s\n' "$SAMPLE_SET" "CREATE TEMP TABLE _dbtool_sample (LIKE $qrel);"
+                 cat "$wd/D.load"
+                 printf '%s\n' "SET client_encoding = 'UTF8';" "${fetch//@REL@/pg_temp._dbtool_sample}"
+               } | ctx_psql_script >"$wd/D.rows"; then
+                hasD=1
+            else
+                warn "could not load the dump's rows into a temp table on ${tlabel}: $(sample_err) — skipping the dump"
+            fi
+        fi
+    fi
+
+    # --- live source --------------------------------------------------------------
+    if [[ -n $src ]]; then
+        load_entry databases "$src" SRC_; use_ctx SRC_; [[ -n $sdb ]] && CTX_DB="$sdb"; resolve_client
+        log "reading the same rows from live source ${CTX_HOST}:${CTX_PORT}/${CTX_DB} (read-only)"
+        if printf '%s\n' "$SAMPLE_SET" "${fetch//@REL@/$qrel}" | ctx_psql_script >"$wd/L.rows"; then hasL=1
+        else warn "reading the source failed: $(sample_err) — skipping it"; fi
+    fi
+    (( hasD || hasL )) || die "nothing to compare the restored rows with (give a source and/or --dump/--latest)"
+
+    # --- show ----------------------------------------------------------------------
+    local -a args=(src=T "$wd/T.rows")
+    (( hasD )) && args+=(src=D "$wd/D.rows")
+    (( hasL )) && args+=(src=L "$wd/L.rows")
+    local report_dir="${CFG_BACKUP_DIR}/reports" ts; ts="$(date +"$CFG_TIMESTAMP_FORMAT")"
+    mkdir -p "$report_dir" 2>/dev/null || report_dir="$RUNDIR"
+    local report="${report_dir}/sample_$(printf '%s' "$sch.$tbl" | tr -c '[:alnum:]._-' '_')_${ts}.txt"
+    local -a bflag=(); for c in "${types[@]}"; do [[ $c == bytea ]] && bflag+=(1) || bflag+=(0); done
+    awk -v NK="${#keys[@]}" -v W="$width" -v DUMP="$hasD" -v LIVE="$hasL" -v BINS="$(IFS=$'\t'; printf '%s' "${bflag[*]}")" \
+        -v KEYS="$(IFS=$'\t'; printf '%s' "${keys[*]}")" -v COLS="$(IFS=$'\t'; printf '%s' "${cols[*]}")" \
+        "$SAMPLE_VIEW_AWK" "${args[@]}" >"$wd/view"
+    {
+        printf '# dbtool %s row sample  %s\n# table: %s.%s   restored: %s%s%s\n' "$DBTOOL_VERSION" "$(date -Iseconds)" \
+            "$sch" "$tbl" "$tlabel" "${dump:+   dump: $(basename "$dump")}" "${src:+   source: $src (now)}"
+        grep -av '^#SUMMARY' "$wd/view"
+    } >"$report"
+    $QUIET || grep -av '^#SUMMARY' "$wd/view"
+    local n bad okd okl
+    IFS=$'\t' read -r _ n bad okd okl < <(grep -a '^#SUMMARY' "$wd/view")
+    if (( bad > 0 )); then
+        err "sample ${sch}.${tbl}: ${bad} of ${n} row(s) differ from the $( ((hasD)) && echo dump || echo source) — report: $report"
+        return 1
+    fi
+    ok "sample ${sch}.${tbl}: ${n} row(s)$( ((hasD)) && printf ', %s match the dump' "$okd")$( ((hasL)) && printf ', %s match the source now' "$okl") — report: $report"
 }
 
 # A restore drill: restore the newest backup into a scratch target, verify the
@@ -1744,13 +2314,13 @@ restore_into_ctx() {  # restore_into_ctx <file> <create> <drop>
                 pg_restore_archive "$CTX_JOBS" "$file"
                 DOCKER_EXTRA=() ;;
             *.dir.tar*)
-                local xdir="$RUNDIR/restore.dir"; mkdir -p "$xdir"
+                make_work_dir restore; local xdir="$WORK_DIR"
                 decompress_stream "$file" | tar -C "$xdir" -xf -
                 local inner; inner="$(find "$xdir" -maxdepth 1 -mindepth 1 -type d | head -1)"
-                DOCKER_EXTRA=(-v "$RUNDIR":"$RUNDIR":ro)
+                DOCKER_EXTRA=(-v "$xdir":"$xdir":ro)
                 log "restoring directory-format dump$([[ -n ${CTX_SEARCH_PATH:-} ]] || echo " (-j $CTX_JOBS)")"
                 pg_restore_archive "$CTX_JOBS" -Fd "$inner"
-                DOCKER_EXTRA=() ;;
+                DOCKER_EXTRA=(); rm -rf "$xdir" ;;
             *)
                 log "restoring plain SQL into ${CTX_HOST}:${CTX_PORT}/${CTX_DB}"
                 decompress_stream "$file" | pg_run psql "${rargs[@]}" -v ON_ERROR_STOP=1 --quiet -f - ;;
@@ -1870,8 +2440,6 @@ cmd_migrate() {
     local S_HOST="$CTX_HOST" S_PORT="$CTX_PORT" S_USER="$CTX_USER" S_PASS="$CTX_PASS" \
           S_DB="$CTX_DB" S_SSL="$CTX_SSLMODE" S_CHARSET="$CTX_CHARSET" S_VER="${PG_SERVER_VER}${MY_SERVER_VER}"
     local S_PGMODE="$PG_MODE" S_PGIMG="$PG_IMAGE" S_MYMODE="$MY_MODE" S_MYIMG="$MY_IMAGE" S_FLAVOR="$MY_FLAVOR"
-    local S_CNF="$RUNDIR/src.cnf"
-    [[ $s_engine == mysql ]] && { write_my_cnf; cp "$MY_CNF" "$S_CNF"; }
 
     use_ctx DST_
     [[ -n $tgt_db ]] && CTX_DB="$tgt_db"
@@ -1900,7 +2468,7 @@ cmd_migrate() {
             CTX_SSLMODE="$S_SSL"; PG_MODE="$S_PGMODE"; PG_IMAGE="$S_PGIMG"
             if pg_snapshot_open && pg_snapshot_run "$(pg_fingerprint_sql "$verify" "${S_VER%%.*}")" "$src_fp"; then
                 S_DUMPARGS+=(--snapshot="$SNAP_ID"); DUMPARGS=("${S_DUMPARGS[@]}")
-                fp_filter_by_dump_args "$src_fp"; snap_ok=true
+                fp_filter_by_dump_args "$src_fp"; fp_zero_excluded_data "$src_fp"; snap_ok=true
             fi
             local snap_err; snap_err="$(pg_snapshot_err)" || true
             CTX_HOST="$T_HOST"; CTX_PORT="$T_PORT"; CTX_USER="$T_USER"; CTX_PASS="$T_PASS"; CTX_DB="$T_DB"
@@ -2069,7 +2637,7 @@ check_dumpable() {  # check_dumpable <db>...
     resolve_client >/dev/null 2>&1 || { err "    cannot resolve a client for ${CTX_HOST}:${CTX_PORT}"; return 1; }
     for db in "$@"; do
         if pg_run pg_dump -h "$CTX_HOST" -p "$CTX_PORT" -U "$CTX_USER" -d "$db" \
-               --no-password --schema-only >/dev/null 2>"$errf"; then
+               --no-password --schema-only </dev/null >/dev/null 2>"$errf"; then
             ok "    dumpable: $db"
         else
             err "    NOT dumpable: $db — $(sed -e 's/^pg_dump: *//' -e '/^$/d' "$errf" | tail -1)"; rc=1
@@ -2082,7 +2650,7 @@ check_my_dumpable() {
     local db rc=0 errf="$RUNDIR/dumpable.err"
     resolve_client >/dev/null 2>&1 || { err "    cannot resolve a client for ${CTX_HOST}:${CTX_PORT}"; return 1; }
     for db in "$@"; do
-        if my_run mysqldump --no-data --skip-lock-tables "$db" >/dev/null 2>"$errf"; then ok "    dumpable: $db"
+        if my_run mysqldump --no-data --skip-lock-tables "$db" </dev/null >/dev/null 2>"$errf"; then ok "    dumpable: $db"
         else err "    NOT dumpable: $db — $(grep -v 'Using a password' "$errf" | tail -1)"; rc=1; fi
     done
     rm -f "$errf"; return $rc
@@ -2192,7 +2760,7 @@ discover_ctx() {  # CTX_* loaded; <entry-label-for-yaml>
               ORDER BY datname" | sed '/^$/d')
     else
         mapfile -t rows < <(_my_rows \
-            "SELECT table_schema || '|' || ROUND(SUM(data_length+index_length)/1024/1024,1) || ' MB'
+            "SELECT CONCAT(table_schema, '|', COALESCE(ROUND(SUM(data_length+index_length)/1024/1024,1), 0), ' MB')
                FROM information_schema.tables
               WHERE table_schema NOT IN ('information_schema','performance_schema','mysql','sys')
               GROUP BY table_schema ORDER BY table_schema" | sed '/^$/d')
@@ -2379,6 +2947,8 @@ COMMANDS
   compare [SOURCE] TARGET        Check restored data against the dump and/or the live source:
           [--dump FILE | --latest NAME] [--full]   row counts (+ content checksums with --full),
           [--database DB] [--target-db DB]         sequences, object counts; exit 1 on mismatch
+          [--sample TABLE [--rows N]]    Show N random rows of TABLE side by side (restored /
+          [--key COLS] [--where SQL]     dump / source now), column by column, diffs marked
   drill NAME -t SCRATCH_TARGET   Restore drill: restore newest backup, verify it, report
           [--full] [--keep]      backup age (RPO) and restore time (RTO), drop the scratch DB
   globals                        Dump cluster roles/grants for every postgres server
@@ -2413,6 +2983,7 @@ EXAMPLES
   ${SCRIPT_NAME} restore --latest app_dev -t staging_pg --create -y
   ${SCRIPT_NAME} restore -f /backup/db/app_dev_postgres_app_dev_20260907-0200.dump -t staging_pg --drop
   ${SCRIPT_NAME} migrate --from app_prod --to new_server_pg --create -y
+  ${SCRIPT_NAME} compare staging_pg --latest app_dev --sample app.orders --rows 3
   ${SCRIPT_NAME} parse-url 'postgresql+asyncpg://app_user:secret@db-primary.example.com:5432/app_dev'
 EOF
 }

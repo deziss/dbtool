@@ -15,8 +15,18 @@ defaults:
   log_file: /var/log/dbtool.log
   retention_days: 14                # local dumps older than this are pruned
   retention_min_keep: 3             # ...but always keep at least N per database
-  compression: zstd                 # zstd | gzip | none  (plain/mysql dumps)
-  pg_compress_level: 6              # internal compression for pg custom format
+  # GFS: past retention_days, still keep the newest dump of each of the last N days/weeks/months/years
+  keep_daily: 7
+  keep_weekly: 4
+  keep_monthly: 6
+  keep_yearly: 0
+  # retention_max_size: 200G        # prune oldest dumps until all of them fit (never below retention_min_keep)
+  # min_free_space: 20G             # before a dump: prune if less is free, refuse if still short
+  compression: zstd                 # zstd | gzip | none  (plain/directory/mysql dumps)
+  # compression_level: 9            # zstd 1-19 (20-22 = ultra), gzip 1-9; default zstd 3 / gzip 6
+  # zstd_long: true                 # zstd long-distance matching: smaller dumps of repetitive data
+  pg_compression: gzip              # gzip | zstd | lz4 | none — pg custom/directory format (zstd/lz4: PG 16+)
+  pg_compress_level: 6              # level for pg_compression
   format: custom                    # custom | plain | directory   (postgres)
   jobs: 4                           # parallel workers for directory dumps
   docker: auto                      # auto | always | never  -> version-matched client
@@ -76,6 +86,9 @@ databases:
     exclude_tables:
       - audit_log
       - celery_taskmeta
+    exclude_table_data:             # keep the table, skip its rows (logs, sessions, caches)
+      - django_session
+      - "*_log"
     dump_args: ["--no-privileges"]
 
   - name: analytics_pg

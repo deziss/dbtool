@@ -12,6 +12,7 @@ Quick reference first; the longer cases follow below it.
 | `pg_restore: error: unsupported version (…) in file header` | Restoring a dump into an **older** PostgreSQL major. Not supported; see [POSTGRES_SUPPORT.md](POSTGRES_SUPPORT.md). |
 | `write /dev/stdout: broken pipe` after a restore error | Harmless: the dump reader was still writing when the restore stopped on the real error printed above it. |
 | `data verification FAILED` after a restore | See [Reading a data verification report](#reading-a-data-verification-report). |
+| Need to see *which* values differ | `dbtool compare TARGET --latest NAME --sample schema.table`; see [Looking at the rows](#looking-at-the-rows---sample). |
 | `checksum MISMATCH … refusing to restore it` | The dump changed after it was written (disk/copy damage, or edited). Use another dump; `dbtool verify FILE` to confirm. |
 | Restore is slow | Custom/directory dumps restore with `-j <jobs>`; raise `jobs` in `defaults` or on the target entry. (`--search-path` restores are single-stream.) |
 | `zstd not installed — falling back to gzip` | Install `zstd`, or set `compression: gzip` to silence it. |
@@ -127,4 +128,28 @@ can still differ while the data is the same if:
 - a column type has no stable text form;
 - a type's output depends on the server's locale.
 
-In those cases rely on `counts`, and spot-check the table by hand.
+In those cases rely on `counts`, and look at the rows with `--sample` (below).
+
+### Looking at the rows: `--sample`
+
+`dbtool compare TARGET --latest NAME --sample schema.table --rows 5` prints random rows from the
+restored database, the dump and the live source side by side. For a `DATA DIFFERS (checksum)`
+table, this shows which column holds the difference.
+
+| Row verdict | Meaning |
+|---|---|
+| `MATCHES dump` | Every column is identical. |
+| `DIFFERS from dump (N column(s))` | The restored row differs. Look at the `DIFF` cells; a value that looks the same is often trailing whitespace or a float digit. |
+| `NOT IN DUMP` | The row exists in the restored database but not in the dump: the target was not empty, or something inserted it after the restore. |
+| `changed in source since backup` / `deleted in source since backup` | The live source changed after the dump. Information only. |
+
+Messages you may see:
+- `has no primary key or NOT NULL unique key`: name the columns that identify a row with
+  `--key col1,col2`.
+- `does not identify a row ... uniquely`: the `--key` columns repeat in the table; add the columns
+  that make a row unique.
+- `is ambiguous`: write it as `schema.table`.
+- `is partitioned`: sample one of its partitions. The dump holds data per partition.
+- `could not load the dump's rows into a temp table`: the target user cannot create
+  temporary tables (or the target is a read-only standby). Grant `TEMP` on the database, or
+  sample against a writable copy.

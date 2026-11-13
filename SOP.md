@@ -106,6 +106,8 @@ dbtool then does the following:
 
 - the verification is green: every table matches the dump on row count (and checksum in
   `full` mode), no sequence is behind, and the object counts match;
+- a row sample of the most important tables (`dbtool compare <target> --latest <name> --sample
+  schema.table --rows 5`) shows `MATCHES dump` for every row;
 - the application starts against the restored database and passes a smoke test;
 - the report path is recorded in the change ticket.
 

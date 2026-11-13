@@ -60,7 +60,7 @@ Releases are published by pushing a tag — the workflow refuses one that disagr
 
 ```bash
 # bump readonly DBTOOL_VERSION in dbtool.sh, add a CHANGELOG section, commit
-git tag -a v1.3.0 -m "dbtool v1.3.0" && git push origin v1.3.0
+git tag -a v1.4.0 -m "dbtool v1.4.0" && git push origin v1.4.0
 ```
 
 Requirements: `bash` 4+, `python3` (stdlib only — PyYAML is used if present, otherwise a
@@ -95,14 +95,16 @@ databases:
 
 Recognised per-entry keys: `engine`, `host`, `port`, `user`, `password`, `password_env`,
 `password_file`, `database`, `sslmode`, `charset`, `format`, `jobs`, `schema_only`,
-`data_only`, `no_owner`, `clean`, `create`, `enabled`, `image`, `exclude_tables`,
+`data_only`, `no_owner`, `clean`, `create`, `enabled`, `image`, `exclude_tables`, `exclude_table_data`,
 `include_tables`, `schemas`, `exclude_schemas`, `dump_args`, `restore_args`, `search_path`
 (targets: the `search_path` a PostgreSQL restore runs with, see [Restore](#restore)).
 Aliases are accepted where obvious (`username`/`uname`, `pass`/`passwd`, `db`/`dbname`,
 `hostname`, `type`/`driver`, `dsn`/`database_url`).
 
 `defaults` controls `backup_dir`, `log_file`, `retention_days`, `retention_min_keep`,
-`compression` (`zstd|gzip|none`), `pg_compress_level`, `format` (`custom|plain|directory`),
+`keep_daily|weekly|monthly|yearly`, `retention_max_size`, `min_free_space`,
+`compression` (`zstd|gzip|none`), `compression_level`, `zstd_long`,
+`pg_compression` (`gzip|zstd|lz4|none`), `pg_compress_level`, `format` (`custom|plain|directory`),
 `jobs`, `docker` (`auto|always|never`), `docker_network`, `timeout`, `timestamp_format`,
 `verify` (`full|header|none`), `fingerprint` (`counts|full|none`), `include_globals`, `lock` and
 `maintenance_db`.
@@ -301,6 +303,42 @@ dbtool migrate --from app_prod --to new_pg --drop --verify-data full -y   # exac
 | Dump data (COPY rows counted from the file) | row counts only | older dumps without a fingerprint |
 | Live source | no: shows the drift since the backup, reported as information | `--latest NAME` of a configured source, or `compare SOURCE TARGET` |
 
+### Look at the rows themselves
+
+Counts and checksums tell you *that* a table differs. `--sample` shows *what* the rows hold. It
+picks N random rows from the restored database by primary key and reads the same keys from the
+dump and the live source. Each column is printed side by side, with differences marked:
+
+```bash
+dbtool compare staging_pg --latest app_dev --sample app.orders --rows 3
+dbtool compare staging_pg --latest app_dev --sample app.orders --where "id = 4711"
+dbtool compare staging_pg --latest app_dev --sample app.audit_log --key event_id,ts   # table without a PK
+```
+
+```
+-- row 1/3  key: id=4711
+  COLUMN    RESTORED                    DUMP    SOURCE(now)
+  id        4711                        =       =
+  status    paid                        =       DIFF refunded
+  payload   \x8a3f1c0e9b... (20480 bytes)  =       =
+  => MATCHES dump; changed in source since backup (1 column(s))
+```
+
+- `=` means the value equals the restored one. `DIFF@N` on a long value gives the position of
+  the first differing character.
+- Values print as COPY text (a tab is `\t`, a newline `\n`, a backslash `\\`); `NULL` is NULL and an
+  empty string is `''`. A long value is cut with its length; a `bytea` shows as hex with its size
+  in bytes.
+- Dump rows go into a `TEMP` table on the target first, so all three sides print with the same
+  session settings (time zone, date style, float digits, bytea format).
+- The command exits with status 1 if a row differs from the dump. When no dump is given, it
+  exits 1 if a row differs from the source. A change on the live source since the backup is
+  information only.
+- Options: `--rows N` (default 5), `--key c1,c2` (for a table without a primary key or a
+  `NOT NULL` unique key), `--where SQL` (restricts which rows can be picked), `--width N` (the
+  column width, default 40). `--sample` can be given more than once. A report is saved to
+  `<backup_dir>/reports/sample_*.txt`.
+
 `--verify-data` also runs `ANALYZE` after the load. `--no-analyze` skips that, and the
 analyze step runs on every PostgreSQL restore anyway. Each check writes a full report to
 `<backup_dir>/reports/`. `dbtool drill NAME -t SCRATCH` combines restore, verify and drop, and
@@ -378,6 +416,38 @@ without locking, and `--set-gtid-purged=OFF` is added only for real MySQL (Maria
 **Retention has a floor.** `retention_days` alone will happily delete everything if a database
 hasn't been backed up in a while; `retention_min_keep` guarantees the N newest dumps per database
 survive regardless of age.
+
+## Retention and disk space
+
+`prune` runs after every `backup all`, and on its own with `dbtool prune`. Use `dbtool -n prune`
+to see what it would delete, and why. All rules apply per database:
+
+| Key | Effect |
+|---|---|
+| `retention_days: 14` | Keep every dump younger than this. |
+| `retention_min_keep: 3` | Always keep the N newest dumps, whatever their age. |
+| `keep_daily: 7`, `keep_weekly: 4`, `keep_monthly: 6`, `keep_yearly: 2` | Grandfather-father-son retention. Past `retention_days`, keep the newest dump of each of the last N days, ISO weeks, months and years that have one. With `retention_days: 0`, everything not picked by these rules goes. |
+| `retention_max_size: 200G` | A cap on the total size of all dumps in `backup_dir`. The oldest go first until the rest fit, but never below `retention_min_keep` (at least 1) per database. |
+| `min_free_space: 20G` | Before each dump, if less than this is free, prune first; if still short, refuse to dump instead of filling the disk. |
+| `s3.keep_remote: false` | Also delete the off-box copy (dump plus sidecars) of everything pruned locally. With `true` (the default), set an expiry lifecycle rule on the bucket. `--no-upload` also skips remote deletion. |
+
+For example, `retention_days: 7` with `keep_weekly: 4, keep_monthly: 12` holds 7 daily, 4
+weekly and 12 monthly dumps: about 23 files, covering a year.
+
+### Making dumps smaller
+
+| Option | Effect | Notes |
+|---|---|---|
+| `exclude_table_data: [django_session, "*_log"]` (per entry) | Dumps the table definition but none of its rows. Often the largest saving: logs, sessions, caches, queues. | PostgreSQL only; uses pg_dump patterns. The restored tables are empty, and data verification expects that. |
+| `exclude_tables` (per entry) | Leaves the table out entirely. | Restores without it; use for throwaway tables only. |
+| `pg_compression: zstd` | pg_dump's own compression for custom/directory format. zstd gives smaller dumps than gzip at the same speed. | Needs PostgreSQL 16+ on the server; otherwise dbtool says so and uses gzip. |
+| `pg_compress_level: 9` | Higher means smaller and slower: gzip 1-9, zstd 1-22, lz4 1-12. | |
+| `compression: zstd`, `compression_level: 9` | Compression of plain/directory/MySQL dumps. zstd 3 (the default) is fast; 9-12 is usually a good balance; 19 is slow. | 20-22 enables `--ultra` (a lot of memory). |
+| `zstd_long: true` | Long-distance matching (`--long=27`): finds repeats up to 128 MB apart. Helps on large, repetitive data. | Reading the dump back needs no extra flag. |
+| `format: plain` + `compression: zstd` | Often the smallest file for text-heavy data, but restores single-threaded and cannot pick single tables. | `custom` stays the default. |
+
+Measure on your own data: run a backup, check the size in `dbtool list`, change one setting,
+and back up again.
 
 **Restore is never silently destructive.** `--drop` prompts, and for PostgreSQL it terminates
 existing backends first (otherwise `DROP DATABASE` fails with "database is being accessed by
