@@ -23,7 +23,7 @@
 #
 set -Eeuo pipefail
 
-readonly DBTOOL_VERSION="1.4.0"
+readonly DBTOOL_VERSION="1.4.1"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The file itself, with symlinks resolved: /usr/local/bin/dbtool is normally a
@@ -1891,11 +1891,12 @@ END { printf "GOT\t%d\n", got + 0 > CTL }'
 # Print the side-by-side view. Args: src=T file [src=D file] [src=L file]; -v NK COLS BINS W
 # (BINS: 1 per bytea column.) Lengths and padding count characters: mawk counts bytes.
 SAMPLE_VIEW_AWK='
-function ulen(s,   t) { if (!BYTES) return length(s); t = s; return length(s) - gsub(/[\200-\277]/, "", t) }
+function cont(c) { return c >= "\200" && c < "\300" }   # a UTF-8 continuation byte (no regex: gawk rejects byte ranges in a UTF-8 locale)
+function ulen(s,   i, n) { if (!BYTES) return length(s); n = 0; for (i = 1; i <= length(s); i++) if (!cont(substr(s, i, 1))) n++; return n }
 function usub(s, n,   i, c, L) {   # the first n characters, never half of a multi-byte one
     if (!BYTES) return substr(s, 1, n)
     L = length(s); c = 0
-    for (i = 1; i <= L; i++) if (substr(s, i, 1) !~ /[\200-\277]/ && ++c > n) break
+    for (i = 1; i <= L; i++) if (!cont(substr(s, i, 1)) && ++c > n) break
     return substr(s, 1, i - 1) }
 function pad(s, w) { return s substr(SP, 1, w - ulen(s)) }
 function isbx(v, bin) { return bin && substr(v, 1, 3) == "\\\\x" }
@@ -1908,7 +1909,7 @@ function show(v, bin,   n) {
     return v }
 function firstdiff(a, b,   i, m) { m = length(a) < length(b) ? length(a) : length(b)
     for (i = 1; i <= m; i++) if (substr(a, i, 1) != substr(b, i, 1)) break
-    if (BYTES) { while (i > 1 && substr(a, i, 1) ~ /[\200-\277]/) i--; i = ulen(substr(a, 1, i - 1)) + 1 }
+    if (BYTES) { while (i > 1 && cont(substr(a, i, 1))) i--; i = ulen(substr(a, 1, i - 1)) + 1 }
     return i }
 function cell(v, base, bin,   p) {
     if (v == base) return "="
@@ -2105,9 +2106,12 @@ sample_table() {
     mkdir -p "$report_dir" 2>/dev/null || report_dir="$RUNDIR"
     local report="${report_dir}/sample_$(printf '%s' "$sch.$tbl" | tr -c '[:alnum:]._-' '_')_${ts}.txt"
     local -a bflag=(); for c in "${types[@]}"; do [[ $c == bytea ]] && bflag+=(1) || bflag+=(0); done
-    awk -v NK="${#keys[@]}" -v W="$width" -v DUMP="$hasD" -v LIVE="$hasL" -v BINS="$(IFS=$'\t'; printf '%s' "${bflag[*]}")" \
+    # LC_ALL=C: count bytes everywhere and do the UTF-8 arithmetic ourselves, the same
+    # under gawk, mawk and busybox whatever the locale
+    LC_ALL=C awk -v NK="${#keys[@]}" -v W="$width" -v DUMP="$hasD" -v LIVE="$hasL" -v BINS="$(IFS=$'\t'; printf '%s' "${bflag[*]}")" \
         -v KEYS="$(IFS=$'\t'; printf '%s' "${keys[*]}")" -v COLS="$(IFS=$'\t'; printf '%s' "${cols[*]}")" \
-        "$SAMPLE_VIEW_AWK" "${args[@]}" >"$wd/view"
+        "$SAMPLE_VIEW_AWK" "${args[@]}" >"$wd/view" || die "sample ${sch}.${tbl}: building the view failed (awk error above)"
+    grep -aq '^#SUMMARY' "$wd/view" || die "sample ${sch}.${tbl}: the view produced no result"
     {
         printf '# dbtool %s row sample  %s\n# table: %s.%s   restored: %s%s%s\n' "$DBTOOL_VERSION" "$(date -Iseconds)" \
             "$sch" "$tbl" "$tlabel" "${dump:+   dump: $(basename "$dump")}" "${src:+   source: $src (now)}"

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.1
+
+- `compare --sample` failed under gawk with a UTF-8 locale (`Invalid collation character`).
+  It then printed `OK` with empty counts instead of failing. The view no longer uses
+  byte-range regexes and runs with `LC_ALL=C`; an awk failure or a missing result now stops
+  with an error.
+
 ## 1.4.0
 
 - `dbtool compare … --sample SCHEMA.TABLE [--rows N]` picks random rows from the restored
